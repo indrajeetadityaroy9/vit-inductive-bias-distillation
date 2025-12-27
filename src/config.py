@@ -140,9 +140,58 @@ class DistillationConfig:
         self.alpha_end = alpha_end  # Ending alpha (at final epoch)
 
 
+class SelfSupervisedDistillationConfig:
+    """
+    Self-supervised token correlation distillation configuration (CST-style).
+
+    Uses a pretrained self-supervised ViT (DINO/DINOv2) as teacher instead of
+    a weaker CNN, distilling token representations and correlations.
+    """
+
+    def __init__(
+        self,
+        # Teacher model settings
+        teacher_type='dinov2',              # 'dino' or 'dinov2'
+        teacher_model_name='dinov2_vits14', # Model name for torch.hub
+        teacher_embed_dim=384,              # Teacher embedding dimension
+        # Token representation distillation (L_tok) - PRIMARY SIGNAL
+        token_layers=None,                  # Layer indices to extract [6, 11] default
+        projection_dim=256,                 # Dimension for alignment projectors
+        lambda_tok=1.0,                     # Weight for token representation loss
+        token_loss_type='cosine',           # 'cosine' or 'mse'
+        # Token correlation distillation (L_rel) - LIGHTWEIGHT REGULARIZER
+        lambda_rel=0.1,                     # Weight for correlation loss (keep small)
+        correlation_temperature=0.1,        # Temperature for softening correlations
+        correlation_loss_type='kl',         # 'kl' (stable) or 'frobenius'
+        use_pooled_correlation=True,        # Use patch-mean pooling to avoid O(N²)
+        # Staged training (essential for stability)
+        rel_warmup_epochs=10,               # Epochs before enabling L_rel
+        projector_warmup_epochs=0,          # Epochs to freeze projectors (optional)
+    ):
+        self.teacher_type = teacher_type
+        self.teacher_model_name = teacher_model_name
+        self.teacher_embed_dim = teacher_embed_dim
+
+        # Token representation distillation
+        self.token_layers = token_layers if token_layers is not None else [6, 11]
+        self.projection_dim = projection_dim
+        self.lambda_tok = lambda_tok
+        self.token_loss_type = token_loss_type
+
+        # Token correlation distillation
+        self.lambda_rel = lambda_rel
+        self.correlation_temperature = correlation_temperature
+        self.correlation_loss_type = correlation_loss_type
+        self.use_pooled_correlation = use_pooled_correlation
+
+        # Staged training
+        self.rel_warmup_epochs = rel_warmup_epochs
+        self.projector_warmup_epochs = projector_warmup_epochs
+
+
 class Config:
     def __init__(self, data=None, model=None, training=None, logging=None,
-                 vit=None, distillation=None,
+                 vit=None, distillation=None, ss_distillation=None,
                  experiment_name="default", seed=42, device="cuda", output_dir="./outputs"):
         self.data = data
         self.model = model
@@ -150,6 +199,7 @@ class Config:
         self.logging = logging
         self.vit = vit  # ViT-specific configuration
         self.distillation = distillation  # Knowledge distillation configuration
+        self.ss_distillation = ss_distillation  # Self-supervised distillation (CST-style)
         self.experiment_name = experiment_name
         self.seed = seed
         self.device = device
@@ -182,6 +232,10 @@ class ConfigManager:
         if 'distillation' in raw_config:
             distillation_config = DistillationConfig(**raw_config['distillation'])
 
+        ss_distillation_config = None
+        if 'ss_distillation' in raw_config:
+            ss_distillation_config = SelfSupervisedDistillationConfig(**raw_config['ss_distillation'])
+
         config = Config(
             data=DataConfig(**raw_config.get('data', {})),
             model=ModelConfig(**raw_config.get('model', {})),
@@ -189,8 +243,9 @@ class ConfigManager:
             logging=LoggingConfig(**raw_config.get('logging', {})),
             vit=vit_config,
             distillation=distillation_config,
+            ss_distillation=ss_distillation_config,
             **{k: v for k, v in raw_config.items()
-               if k not in ['data', 'model', 'training', 'logging', 'vit', 'distillation']}
+               if k not in ['data', 'model', 'training', 'logging', 'vit', 'distillation', 'ss_distillation']}
         )
 
         ConfigManager.validate_config(config)
@@ -251,6 +306,8 @@ class ConfigManager:
             config_dict['vit'] = config.vit.__dict__
         if config.distillation is not None:
             config_dict['distillation'] = config.distillation.__dict__
+        if config.ss_distillation is not None:
+            config_dict['ss_distillation'] = config.ss_distillation.__dict__
 
         if save_path.suffix in ['.yml', '.yaml']:
             with open(save_path, 'w') as f:

@@ -1,0 +1,121 @@
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    color_jitter: true
+    cutout: true
+    randaugment: true
+    randaugment_n: 2
+    randaugment_m: 9
+    mixup: true
+    mixup_alpha: 0.8
+    cutmix: false
+    cutmix_alpha: 1.0
+  batch_size: 256  # Reduced from 1024 due to teacher memory overhead
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean:
+    - 0.4914
+    - 0.4822
+    - 0.4465
+    std:
+    - 0.2470
+    - 0.2435
+    - 0.2616
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+
+device: cuda
+experiment_name: deit_ss_distill_cifar
+output_dir: ./outputs
+seed: 42
+
+logging:
+  log_dir: ./logs
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false
+  wandb_entity: null
+  wandb_project: adaptive-cnn
+
+model:
+  model_type: deit
+  in_channels: 3
+  num_classes: 10
+  architecture: []
+  classifier_layers: []
+  dropout: 0.0
+  use_se: false
+
+vit:
+  variant: tiny
+  img_size: 32
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 2.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: true
+  convert_grayscale: false
+  use_conv_stem: true
+  cls_token_dropout: 0.1
+  inference_mode: avg
+
+ss_distillation:
+  # Teacher: DINOv2 ViT-S/14 (strong self-supervised features)
+  teacher_type: dinov2
+  teacher_model_name: dinov2_vits14
+  teacher_embed_dim: 384
+
+  # Token representation distillation (L_tok) - PRIMARY SIGNAL
+  token_layers:
+    - 6
+    - 11
+  projection_dim: 256
+  lambda_tok: 1.0
+  token_loss_type: cosine
+
+  # Token correlation distillation (L_rel) - LIGHTWEIGHT REGULARIZER
+  lambda_rel: 0.1
+  correlation_temperature: 0.1
+  correlation_loss_type: kl
+  use_pooled_correlation: true
+
+  # Staged training (essential for stability)
+  rel_warmup_epochs: 10
+  projector_warmup_epochs: 0
+
+training:
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0005
+  lr_scheduler_params:
+    T_max: 100
+    eta_min: 0.00001
+  label_smoothing: 0.1
+  use_swa: false
+  swa_start_epoch: 0.75
+  swa_lr: 0.0001
+  # H100 optimizations
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true

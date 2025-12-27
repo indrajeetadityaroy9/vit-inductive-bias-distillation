@@ -550,6 +550,87 @@ class DeiT(nn.Module):
 
         return cls_out, None, cls_out
 
+    def forward_with_intermediates(self, x, layer_indices=None):
+        """
+        Forward pass that returns intermediate layer outputs for distillation.
+
+        Used for CST-style self-supervised distillation where we match
+        intermediate token representations between teacher and student.
+
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+            layer_indices: List of layer indices to capture (0-indexed, e.g., [6, 11])
+                          If None, returns only final output
+
+        Returns:
+            dict with keys:
+                - 'output': Final classification output(s) - tuple during training
+                - 'intermediates': Dict mapping layer_idx -> (B, N_patches, embed_dim)
+                - 'patch_tokens': Final patch tokens before head (B, N_patches, embed_dim)
+        """
+        if layer_indices is None:
+            layer_indices = []
+
+        intermediates = {}
+
+        # Channel expansion for grayscale
+        if self.channel_expand is not None:
+            x = self.channel_expand(x)
+
+        # Patch embedding
+        x = self.patch_embed(x)
+
+        # Prepend tokens
+        B = x.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        if self.distillation:
+            dist_tokens = self.dist_token.expand(B, -1, -1)
+            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
+            num_special_tokens = 2
+        else:
+            x = torch.cat([cls_tokens, x], dim=1)
+            num_special_tokens = 1
+
+        # Add positional embedding
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        # Pass through transformer blocks, capturing intermediates
+        for idx, block in enumerate(self.blocks):
+            x = block(x)
+            if idx in layer_indices:
+                # Store intermediate: only patch tokens (exclude CLS/DIST tokens)
+                intermediates[idx] = x[:, num_special_tokens:, :].clone()
+
+        # Final normalization
+        x = self.norm(x)
+
+        # Extract patch tokens (excluding special tokens)
+        patch_tokens = x[:, num_special_tokens:, :]
+
+        # Classification heads
+        cls_out = self.head(x[:, 0])
+
+        if self.distillation and self.head_dist is not None:
+            dist_out = self.head_dist(x[:, 1])
+            if self.training:
+                output = (cls_out, dist_out)
+            else:
+                if self.inference_mode == 'cls':
+                    output = cls_out
+                elif self.inference_mode == 'dist':
+                    output = dist_out
+                else:
+                    output = (cls_out + dist_out) / 2
+        else:
+            output = cls_out
+
+        return {
+            'output': output,
+            'intermediates': intermediates,
+            'patch_tokens': patch_tokens
+        }
+
 
 # DeiT variant configurations
 DEIT_CONFIGS = {

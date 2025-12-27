@@ -6,11 +6,12 @@ A modular CNN classification pipeline that dynamically adjusts its architecture 
 
 1. **Adaptive Architecture Design**: A single model class that dynamically instantiates dataset-specific layer configurations with ResidualBlocks and SE attention
 2. **Vision Transformer (DeiT/ViT)**: Data-efficient Image Transformer with optional knowledge distillation from CNN teachers
-3. **Multi-GPU Training**: Distributed Data Parallel (DDP) support for efficient multi-GPU training
-4. **Knowledge Distillation**: Hard/soft distillation with configurable alpha scheduling (constant, linear, cosine)
-5. **Advanced Augmentation**: RandAugment, MixUp, CutMix, Cutout, and traditional augmentations
-6. **Modern Training Techniques**: Mixed precision (AMP/BF16), Stochastic Weight Averaging (SWA), label smoothing, cosine annealing
-7. **Interpretability Tools**: GradCAM, feature map visualization, confusion matrices, ROC curves
+3. **Self-Supervised Distillation (CST-style)**: Token representation and correlation distillation from DINOv2 pretrained teachers
+4. **Multi-GPU Training**: Distributed Data Parallel (DDP) support for efficient multi-GPU training
+5. **Knowledge Distillation**: Hard/soft distillation with configurable alpha scheduling (constant, linear, cosine)
+6. **Advanced Augmentation**: RandAugment, MixUp, CutMix, Cutout, and traditional augmentations
+7. **Modern Training Techniques**: Mixed precision (AMP/BF16), Stochastic Weight Averaging (SWA), label smoothing, cosine annealing
+8. **Interpretability Tools**: GradCAM, feature map visualization, confusion matrices, ROC curves
 
 ## Architecture
 
@@ -146,8 +147,9 @@ Distillation Head* (DIST token → num_classes)
 | Model | MNIST | CIFAR-10 |
 |-------|-------|----------|
 | **AdaptiveCNN** | 99.08% | 82.90% |
-| **DeiT (Distilled)** | 99.54% | 84.39% |
-| **ViT (No Distillation)** | **99.64%** | **86.02%** |
+| **DeiT (CNN Distilled)** | 99.54% | 84.39% |
+| **ViT (No Distillation)** | 99.64% | 86.02% |
+| **DeiT (CST-SSL Distilled)** | - | **89.18%** |
 
 ### AdaptiveCNN (Teacher) Performance
 
@@ -211,14 +213,34 @@ Distillation Head* (DIST token → num_classes)
 | **F1-Score (Macro)** | 0.8591 |
 | **AUC (Macro)** | 0.9886 |
 
+### DeiT with Self-Supervised Distillation (CST-style)
+
+**CIFAR-10** (4.3M parameters, distilled from DINOv2 ViT-S/14):
+
+| Metric | Score |
+|--------|-------|
+| **Accuracy** | **89.18%** |
+| **Precision (Macro)** | 0.8920 |
+| **Recall (Macro)** | 0.8918 |
+| **F1-Score (Macro)** | 0.8911 |
+| **AUC (Macro)** | 0.9903 |
+| **Top-3 Accuracy** | 98.08% |
+| **Top-5 Accuracy** | 99.47% |
+
+**Method:** CST-style (Contrastive Self-supervised Token) distillation using:
+- **Token Representation Loss (L_tok)**: Aligns intermediate layer tokens between student and DINOv2 teacher via learnable projectors
+- **Token Correlation Loss (L_rel)**: Matches token-token relational structure using KL divergence on correlation matrices
+- **Staged Training**: L_tok only for epochs 0-9, then L_tok + L_rel for epochs 10+
+- **Loss**: `L = L_ce + 1.0 × L_tok + 0.1 × L_rel`
+
 ### Negative Transfer Effect Analysis
 
-A key finding from our experiments: **ViT without distillation outperforms DeiT with distillation**.
+A key finding from our experiments: **CNN-distilled DeiT underperforms ViT without distillation**.
 
-**CIFAR-10 Results:**
+**CIFAR-10 Results (CNN Distillation):**
 ```
-ViT (86.02%) > DeiT (84.39%) > CNN (82.90%)
-       +1.63%         +1.49%
+ViT (86.02%) > DeiT-CNN (84.39%) > CNN (82.90%)
+       +1.63%            +1.49%
 ```
 
 **Root Cause:** The teacher CNN (82.90%) was weaker than what the student could achieve independently. This caused:
@@ -227,7 +249,21 @@ ViT (86.02%) > DeiT (84.39%) > CNN (82.90%)
 2. **Teacher Ceiling Effect** - With α=0.6, 60% of the loss pushed toward the teacher's 82.9% accuracy ceiling
 3. **Constrained Optimization** - Hard distillation forced matching teacher predictions instead of learning optimal features
 
-**Key Insight:** Knowledge distillation only helps when the teacher significantly outperforms the student's potential. With a weak teacher, distillation can limit rather than enhance student performance.
+**Solution: Self-Supervised Distillation (CST-style)**
+
+By replacing the weak CNN teacher with DINOv2 (a self-supervised pretrained ViT) and distilling token representations instead of logits, we avoid the negative transfer:
+
+```
+DeiT-CST (89.18%) > ViT (86.02%) > DeiT-CNN (84.39%) > CNN (82.90%)
+         +3.16%           +1.63%            +1.49%
+```
+
+**Why CST-SSL Works:**
+1. **No Logit Imitation** - Student learns relational structure, not teacher's classification decisions
+2. **Strong Teacher Features** - DINOv2's self-supervised features provide rich supervision without task-specific bias
+3. **Intermediate Alignment** - Token-level distillation preserves inductive biases while transferring knowledge
+
+**Key Insight:** Knowledge distillation with weak teachers causes negative transfer. Self-supervised relational distillation avoids this by transferring feature structure rather than classification outputs.
 
 ### Training Time (2× NVIDIA H100 80GB)
 
@@ -235,10 +271,11 @@ ViT (86.02%) > DeiT (84.39%) > CNN (82.90%)
 |-------|---------|---------------|--------|
 | AdaptiveCNN | MNIST | ~1 minute | 20 |
 | AdaptiveCNN | CIFAR-10 | ~4 minutes | 40 |
-| DeiT (Distilled) | MNIST | ~4 minutes | 50 |
-| DeiT (Distilled) | CIFAR-10 | ~12 minutes | 100 |
+| DeiT (CNN Distilled) | MNIST | ~4 minutes | 50 |
+| DeiT (CNN Distilled) | CIFAR-10 | ~12 minutes | 100 |
 | ViT | MNIST | ~4 minutes | 50 |
 | ViT | CIFAR-10 | ~17 minutes | 100 |
+| DeiT (CST-SSL) | CIFAR-10 | ~25 minutes | 100 |
 
 ## Usage
 
@@ -265,13 +302,19 @@ python main.py train configs/vit_mnist_config.yaml --num-gpus 2
 python main.py train configs/vit_cifar_config.yaml --num-gpus 2
 ```
 
-**DeiT (with knowledge distillation):**
+**DeiT (with CNN knowledge distillation):**
 ```bash
 # First train the teacher (AdaptiveCNN)
 python main.py train configs/cifar_improved_config.yaml --num-gpus 2
 
 # Then train DeiT with distillation from the teacher
 python main.py train-distill configs/deit_cifar_config.yaml --num-gpus 2
+```
+
+**DeiT (with CST-style self-supervised distillation):**
+```bash
+# Train DeiT with token distillation from DINOv2 (no CNN teacher needed)
+python main.py train-ss-distill configs/deit_ss_distill_cifar_config.yaml --num-gpus 1
 ```
 
 ### Evaluation
@@ -295,12 +338,13 @@ python main.py test configs/cifar_improved_config.yaml ./outputs/checkpoints/bes
 
 ```
 ├── configs/                    # Configuration files
-│   ├── mnist_improved_config.yaml    # AdaptiveCNN for MNIST
-│   ├── cifar_improved_config.yaml    # AdaptiveCNN for CIFAR-10
-│   ├── vit_mnist_config.yaml         # ViT for MNIST (no distillation)
-│   ├── vit_cifar_config.yaml         # ViT for CIFAR-10 (no distillation)
-│   ├── deit_mnist_config.yaml        # DeiT for MNIST (with distillation)
-│   └── deit_cifar_config.yaml        # DeiT for CIFAR-10 (with distillation)
+│   ├── mnist_improved_config.yaml         # AdaptiveCNN for MNIST
+│   ├── cifar_improved_config.yaml         # AdaptiveCNN for CIFAR-10
+│   ├── vit_mnist_config.yaml              # ViT for MNIST (no distillation)
+│   ├── vit_cifar_config.yaml              # ViT for CIFAR-10 (no distillation)
+│   ├── deit_mnist_config.yaml             # DeiT for MNIST (CNN distillation)
+│   ├── deit_cifar_config.yaml             # DeiT for CIFAR-10 (CNN distillation)
+│   └── deit_ss_distill_cifar_config.yaml  # DeiT for CIFAR-10 (CST-SSL distillation)
 ├── src/
 │   ├── config.py              # Configuration management
 │   ├── models.py              # AdaptiveCNN with ResidualBlock + SE
