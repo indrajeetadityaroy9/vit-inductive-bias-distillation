@@ -21,7 +21,8 @@ class DataConfig:
 
 class ModelConfig:
     def __init__(self, model_type="adaptive_cnn", in_channels=1, num_classes=10,
-                 dropout=0.5, use_se=True, architecture=None, classifier_layers=None):
+                 dropout=0.5, use_se=True, architecture=None, classifier_layers=None,
+                 pretrained=False, drop_path_rate=0.0):
         self.model_type = model_type
         self.in_channels = in_channels
         self.num_classes = num_classes
@@ -29,6 +30,8 @@ class ModelConfig:
         self.use_se = use_se
         self.architecture = architecture if architecture is not None else []
         self.classifier_layers = classifier_layers if classifier_layers is not None else []
+        self.pretrained = pretrained  # For pretrained models like ConvNeXt V2
+        self.drop_path_rate = drop_path_rate  # Stochastic depth
 
 class TrainingConfig:
     def __init__(self, num_epochs=10, learning_rate=0.001, weight_decay=0.0005,
@@ -146,6 +149,12 @@ class SelfSupervisedDistillationConfig:
 
     Uses a pretrained self-supervised ViT (DINO/DINOv2) as teacher instead of
     a weaker CNN, distilling token representations and correlations.
+
+    Supports multiple structural loss types:
+    - Token representation (L_tok): Cosine/MSE similarity on projected tokens
+    - Token correlation (L_rel): KL/Frobenius on correlation matrices
+    - CKA (L_cka): Centered Kernel Alignment for structural similarity
+    - Gram matrix (L_gram): Direct gram matrix comparison (ablation baseline)
     """
 
     def __init__(
@@ -167,6 +176,18 @@ class SelfSupervisedDistillationConfig:
         # Staged training (essential for stability)
         rel_warmup_epochs=10,               # Epochs before enabling L_rel
         projector_warmup_epochs=0,          # Epochs to freeze projectors (optional)
+        # CKA structural loss (PRIMARY for structural distillation)
+        use_cka_loss=False,                 # Enable CKA-based structural loss
+        lambda_cka=0.5,                     # Weight for CKA loss
+        cka_kernel_type='linear',           # 'linear' or 'rbf' kernel
+        cka_warmup_epochs=5,                # Epochs before enabling CKA loss
+        # Gram matrix loss (ablation baseline)
+        use_gram_loss=False,                # Enable Gram matrix loss (for ablation)
+        lambda_gram=0.5,                    # Weight for Gram matrix loss
+        # Dual-path augmentation for teacher/student
+        use_dual_augment=True,              # Use clean images for teacher
+        # CLS-only mode for global semantic alignment
+        use_cls_only=False,                 # Use CLS token instead of patch tokens
     ):
         self.teacher_type = teacher_type
         self.teacher_model_name = teacher_model_name
@@ -187,6 +208,22 @@ class SelfSupervisedDistillationConfig:
         # Staged training
         self.rel_warmup_epochs = rel_warmup_epochs
         self.projector_warmup_epochs = projector_warmup_epochs
+
+        # CKA structural loss
+        self.use_cka_loss = use_cka_loss
+        self.lambda_cka = lambda_cka
+        self.cka_kernel_type = cka_kernel_type
+        self.cka_warmup_epochs = cka_warmup_epochs
+
+        # Gram matrix loss (ablation)
+        self.use_gram_loss = use_gram_loss
+        self.lambda_gram = lambda_gram
+
+        # Dual-path augmentation
+        self.use_dual_augment = use_dual_augment
+
+        # CLS-only mode
+        self.use_cls_only = use_cls_only
 
 
 class Config:
@@ -261,9 +298,18 @@ class ConfigManager:
             raise ValueError(f"Invalid dataset: {config.data.dataset}")
 
         # Validate model type
-        valid_model_types = ['adaptive_cnn', 'deit']
+        # Note: convnext_v2_tiny requires timm library
+        valid_model_types = [
+            'adaptive_cnn',      # Original teacher (SE blocks)
+            'deit',              # Vision Transformer student
+            'resnet18_cifar',    # ResNet-18 adapted for CIFAR (classic CNN control)
+            'convnext_v2_tiny',  # ConvNeXt V2-Tiny (modern CNN bridge)
+        ]
         if config.model.model_type not in valid_model_types:
-            raise ValueError(f"Invalid model_type: {config.model.model_type}")
+            raise ValueError(
+                f"Invalid model_type: {config.model.model_type}. "
+                f"Valid types: {valid_model_types}"
+            )
 
         if config.data.batch_size <= 0:
             raise ValueError("Batch size must be positive")

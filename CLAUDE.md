@@ -19,7 +19,10 @@ bash scripts/quick_test.sh
 python main.py train configs/mnist_improved_config.yaml
 python main.py train configs/cifar_improved_config.yaml --num-gpus 2
 
-# Train DeiT with CNN knowledge distillation
+# Train ViT (no distillation)
+python main.py train configs/vit_cifar_config.yaml --num-gpus 2
+
+# Train DeiT with CNN knowledge distillation (requires trained CNN teacher)
 python main.py train-distill configs/deit_cifar_config.yaml --num-gpus 2
 
 # Train DeiT with self-supervised distillation (DINOv2 teacher)
@@ -31,12 +34,26 @@ python main.py evaluate configs/cifar_improved_config.yaml ./outputs/checkpoints
 # Single image inference with test-time augmentation
 python main.py test configs/cifar_improved_config.yaml ./outputs/checkpoints/best_model.pth image.jpg --tta
 
-# Code quality (tools in requirements.txt)
+# Code quality
 black src/
 flake8 src/
 mypy src/
 isort src/
+
+# Run tests
+pytest
+pytest -v --cov=src  # with coverage
 ```
+
+## CLI Reference
+
+| Command | Description |
+|---------|-------------|
+| `train CONFIG [--num-gpus N]` | Train AdaptiveCNN or ViT model |
+| `train-distill CONFIG [--num-gpus N]` | Train DeiT with CNN teacher distillation |
+| `train-ss-distill CONFIG [--num-gpus N]` | Train DeiT with DINOv2 self-supervised distillation |
+| `evaluate CONFIG CHECKPOINT` | Evaluate model on test set |
+| `test CONFIG CHECKPOINT IMAGE [--tta]` | Single image inference |
 
 ## Architecture
 
@@ -132,3 +149,18 @@ ss_distillation:  # For DINOv2→ViT
 - **SWA activation**: Starts at 75% of training by default
 - **Early stopping**: Patience=15 epochs by default
 - **Dataset auto-download**: MNIST/CIFAR-10 downloaded to `./data/` via torchvision
+
+### Checkpoint Format
+
+Saved checkpoints contain:
+- `model_state_dict`: Model weights
+- `optimizer_state_dict`: Optimizer state
+- `best_val_acc`: Best validation accuracy
+- `epoch`: Current epoch number
+- `config`: Training configuration
+
+To load a checkpoint for evaluation:
+```python
+checkpoint = torch.load(path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
+```

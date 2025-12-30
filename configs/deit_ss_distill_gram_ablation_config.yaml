@@ -1,0 +1,110 @@
+# DeiT with DINOv2 Gram Matrix Ablation Configuration
+# Ablation Study: Gram matrix loss vs CKA loss
+# Uses Gram matrix instead of CKA for structural comparison
+
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    auto_augment: true
+    cutout: true
+    cutmix: false
+    mixup: false
+  batch_size: 512
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2470, 0.2435, 0.2616]
+  num_workers: 16
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+device: cuda
+experiment_name: deit_dinov2_gram_ablation
+output_dir: ./outputs/deit_dinov2_gram_ablation
+
+seed: 42
+
+model:
+  model_type: deit
+  in_channels: 3
+  num_classes: 10
+  dropout: 0.1
+
+vit:
+  variant: tiny
+  img_size: 32
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: true
+  convert_grayscale: false
+  inference_mode: avg
+
+training:
+  num_epochs: 200
+  learning_rate: 0.0005
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.001
+  label_smoothing: 0.1
+  use_swa: true
+  swa_start_epoch: 0.8
+  swa_lr: 0.0001
+  lr_scheduler_params:
+    T_max: 200
+    eta_min: 0.000001
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true
+
+# Self-supervised distillation with Gram matrix loss (ablation)
+ss_distillation:
+  teacher_type: dinov2
+  teacher_model_name: dinov2_vits14
+  teacher_embed_dim: 384
+
+  token_layers: [3, 6, 9, 11]
+  projection_dim: 256
+  lambda_tok: 0.5
+  token_loss_type: cosine
+
+  lambda_rel: 0.05
+  correlation_temperature: 0.1
+  correlation_loss_type: kl
+  use_pooled_correlation: true
+  rel_warmup_epochs: 10
+
+  # Gram matrix loss (ABLATION - instead of CKA)
+  use_cka_loss: false
+  lambda_cka: 0.0
+
+  use_gram_loss: true
+  lambda_gram: 0.5
+
+  use_dual_augment: true
+  projector_warmup_epochs: 0
+
+logging:
+  log_dir: ./logs/deit_dinov2_gram_ablation
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false

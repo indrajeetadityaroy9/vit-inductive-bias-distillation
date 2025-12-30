@@ -181,6 +181,10 @@ class MultiHeadSelfAttention(nn.Module):
 
     Uses F.scaled_dot_product_attention (SDPA) which automatically dispatches to
     Flash Attention v2 on H100 GPUs for 25-40% speedup and reduced memory usage.
+
+    Supports optional attention weight extraction for analytics via return_attention
+    parameter. Note: When return_attention=True, uses manual attention computation
+    instead of SDPA (slower but provides attention weights).
     """
 
     def __init__(self, embed_dim, num_heads, attn_drop=0.0, proj_drop=0.0):
@@ -195,7 +199,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+        # Storage for attention weights (used by AttentionDistanceAnalyzer)
+        self.attn_weights = None
+
+    def forward(self, x, return_attention=False):
         B, N, C = x.shape
 
         # QKV projection and reshape: (B, N, 3*C) -> (3, B, heads, N, head_dim)
@@ -203,7 +210,18 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        if HAS_SDPA:
+        if return_attention:
+            # Manual attention computation to extract weights
+            # Cannot use SDPA as it doesn't return attention weights
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+
+            # Store attention weights for later extraction (B, heads, N, N)
+            self.attn_weights = attn.detach()
+
+            attn = self.attn_drop(attn)
+            x = attn @ v
+        elif HAS_SDPA:
             # Use SDPA for automatic Flash Attention dispatch on H100
             # This provides 25-40% speedup and reduced memory usage
             dropout_p = self.attn_drop.p if self.training else 0.0
@@ -218,6 +236,9 @@ class MultiHeadSelfAttention(nn.Module):
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        if return_attention:
+            return x, self.attn_weights
         return x
 
 
@@ -270,8 +291,12 @@ class TransformerBlock(nn.Module):
         mlp_hidden_dim = int(embed_dim * mlp_ratio)
         self.mlp = MLP(embed_dim, hidden_features=mlp_hidden_dim, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(self, x, return_attention=False):
+        if return_attention:
+            attn_out, attn_weights = self.attn(self.norm1(x), return_attention=True)
+            x = x + self.drop_path(attn_out)
+        else:
+            x = x + self.drop_path(self.attn(self.norm1(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -550,7 +575,7 @@ class DeiT(nn.Module):
 
         return cls_out, None, cls_out
 
-    def forward_with_intermediates(self, x, layer_indices=None):
+    def forward_with_intermediates(self, x, layer_indices=None, return_cls_only=False):
         """
         Forward pass that returns intermediate layer outputs for distillation.
 
@@ -561,12 +586,13 @@ class DeiT(nn.Module):
             x: Input tensor of shape (B, C, H, W)
             layer_indices: List of layer indices to capture (0-indexed, e.g., [6, 11])
                           If None, returns only final output
+            return_cls_only: If True, return only CLS token (B, 1, D) instead of patches
 
         Returns:
             dict with keys:
                 - 'output': Final classification output(s) - tuple during training
-                - 'intermediates': Dict mapping layer_idx -> (B, N_patches, embed_dim)
-                - 'patch_tokens': Final patch tokens before head (B, N_patches, embed_dim)
+                - 'intermediates': Dict mapping layer_idx -> (B, N_patches, embed_dim) or (B, 1, embed_dim)
+                - 'patch_tokens': Final patch/CLS tokens before head
         """
         if layer_indices is None:
             layer_indices = []
@@ -599,14 +625,21 @@ class DeiT(nn.Module):
         for idx, block in enumerate(self.blocks):
             x = block(x)
             if idx in layer_indices:
-                # Store intermediate: only patch tokens (exclude CLS/DIST tokens)
-                intermediates[idx] = x[:, num_special_tokens:, :].clone()
+                if return_cls_only:
+                    # Store CLS token only (position 0) for global semantic alignment
+                    intermediates[idx] = x[:, 0:1, :].clone()  # (B, 1, D)
+                else:
+                    # Store intermediate: only patch tokens (exclude CLS/DIST tokens)
+                    intermediates[idx] = x[:, num_special_tokens:, :].clone()
 
         # Final normalization
         x = self.norm(x)
 
-        # Extract patch tokens (excluding special tokens)
-        patch_tokens = x[:, num_special_tokens:, :]
+        # Extract patch/CLS tokens (excluding special tokens)
+        if return_cls_only:
+            patch_tokens = x[:, 0:1, :]  # CLS token only (B, 1, D)
+        else:
+            patch_tokens = x[:, num_special_tokens:, :]
 
         # Classification heads
         cls_out = self.head(x[:, 0])
@@ -630,6 +663,49 @@ class DeiT(nn.Module):
             'intermediates': intermediates,
             'patch_tokens': patch_tokens
         }
+
+    def get_attention_weights(self, x):
+        """
+        Extract attention weights from all transformer blocks.
+
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+
+        Returns:
+            Dict mapping layer_idx -> attention weights (B, num_heads, N, N)
+        """
+        attention_weights = {}
+
+        # Channel expansion for grayscale
+        if self.channel_expand is not None:
+            x = self.channel_expand(x)
+
+        # Patch embedding
+        x = self.patch_embed(x)
+
+        # Prepend tokens
+        B = x.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        if self.distillation:
+            dist_tokens = self.dist_token.expand(B, -1, -1)
+            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
+        else:
+            x = torch.cat([cls_tokens, x], dim=1)
+
+        # Add positional embedding
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        # Pass through transformer blocks with attention extraction
+        for idx, block in enumerate(self.blocks):
+            # Forward with attention extraction
+            x = block(x, return_attention=True)
+
+            # Extract stored attention weights
+            if hasattr(block.attn, 'attn_weights') and block.attn.attn_weights is not None:
+                attention_weights[idx] = block.attn.attn_weights.detach()
+
+        return attention_weights
 
 
 # DeiT variant configurations

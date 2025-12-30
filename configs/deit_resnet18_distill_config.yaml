@@ -1,0 +1,93 @@
+# DeiT with ResNet-18 Teacher Distillation Configuration
+# EXP-1: Classic CNN → ViT distillation (expected: negative transfer or marginal gain)
+
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    auto_augment: true
+    cutout: true
+    cutmix: true
+    cutmix_alpha: 1.0
+  batch_size: 1024      # Per GPU - H100 optimized
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2470, 0.2435, 0.2616]
+  num_workers: 16
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+device: cuda
+experiment_name: deit_resnet18_distill
+output_dir: ./outputs/deit_resnet18_distill
+
+seed: 42
+
+model:
+  model_type: deit
+  in_channels: 3
+  num_classes: 10
+  dropout: 0.1
+
+vit:
+  variant: tiny
+  img_size: 32
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: true
+  convert_grayscale: false
+  inference_mode: avg
+
+training:
+  num_epochs: 200
+  learning_rate: 0.0005
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.001
+  label_smoothing: 0.1
+  use_swa: true
+  swa_start_epoch: 0.8
+  swa_lr: 0.0001
+  lr_scheduler_params:
+    T_max: 200
+    eta_min: 0.000001
+  # H100 optimizations
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true
+
+# CNN → ViT Distillation
+distillation:
+  teacher_checkpoint: ./outputs/resnet18_cifar/checkpoints/best_model.pth
+  teacher_model_type: resnet18_cifar
+  distillation_type: soft        # Soft KL divergence
+  alpha: 0.5                     # Balance between CE and distillation
+  tau: 4.0                       # Temperature for softening
+  distillation_warmup_epochs: 5
+  alpha_schedule: constant
+
+logging:
+  log_dir: ./logs/deit_resnet18_distill
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false

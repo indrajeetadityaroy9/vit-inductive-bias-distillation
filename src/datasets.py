@@ -115,6 +115,65 @@ class CutMixDataset(Dataset):
 
         return bbx1, bby1, bbx2, bby2
 
+
+class DualAugmentDataset(Dataset):
+    """
+    Dual-path augmentation dataset for self-supervised distillation.
+
+    Returns (clean_img, augmented_img, target) tuple where:
+    - clean_img: Only normalized (for teacher like DINOv2)
+    - augmented_img: Full augmentation pipeline (for student like DeiT)
+    - target: Integer class label (MixUp/CutMix applied in training loop)
+
+    This avoids the "MixUp Trap" where self-supervised teachers (trained on
+    natural images) degrade when fed heavily augmented inputs.
+
+    Usage in training loop:
+        for batch in loader:
+            clean_imgs, student_imgs, targets = batch
+            # Resize clean_imgs to 224x224 for DINOv2
+            clean_224 = F.interpolate(clean_imgs, (224, 224), mode='bicubic')
+            with torch.no_grad():
+                teacher_features = teacher(clean_224)
+            # Apply MixUp ONLY to student_imgs and targets (in loop, not here)
+            if mixup_fn:
+                student_imgs, targets = mixup_fn(student_imgs, targets)
+            student_out = student(student_imgs)
+    """
+
+    def __init__(self, base_dataset, clean_transform, student_transform):
+        """
+        Args:
+            base_dataset: Raw dataset (e.g., CIFAR10 with transform=None)
+            clean_transform: Minimal transform for teacher (resize, to_tensor, normalize)
+            student_transform: Full augmentation for student (crop, flip, cutout, etc.)
+        """
+        self.base_dataset = base_dataset
+        self.clean_transform = clean_transform
+        self.student_transform = student_transform
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        # Get raw image and target from base dataset
+        # Note: base_dataset should have transform=None or return PIL images
+        img, target = self.base_dataset[idx]
+
+        # If img is already a tensor (base dataset has transform), we need raw
+        if torch.is_tensor(img):
+            raise ValueError(
+                "DualAugmentDataset requires base_dataset with transform=None. "
+                "Got tensor instead of PIL Image."
+            )
+
+        # Apply different transforms for teacher (clean) and student (augmented)
+        clean_img = self.clean_transform(img)
+        augmented_img = self.student_transform(img)
+
+        return clean_img, augmented_img, target
+
+
 class DatasetManager:
 
     @staticmethod
@@ -364,6 +423,189 @@ class DatasetManager:
             'image_size': image_size,
             'classes': classes
         }
+
+    @staticmethod
+    def get_clean_transform(config):
+        """
+        Get minimal transform for teacher (clean images).
+
+        Only applies resize, to_tensor, and normalization.
+        No augmentation - used for self-supervised teachers like DINOv2.
+        """
+        dataset = config.data.dataset
+        transform_list = []
+
+        if dataset == 'mnist':
+            transform_list.extend([
+                transforms.Resize((28, 28)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=config.data.normalization['mean'],
+                    std=config.data.normalization['std']
+                )
+            ])
+        elif dataset == 'cifar':
+            transform_list.extend([
+                transforms.Resize((32, 32)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=config.data.normalization['mean'],
+                    std=config.data.normalization['std']
+                )
+            ])
+        else:
+            aug_config = config.data.augmentation
+            size = aug_config.get('image_size', 224)
+            transform_list.extend([
+                transforms.Resize((size, size)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=config.data.normalization.get('mean', [0.485, 0.456, 0.406]),
+                    std=config.data.normalization.get('std', [0.229, 0.224, 0.225])
+                )
+            ])
+
+        return transforms.Compose(transform_list)
+
+    @staticmethod
+    def get_dual_augment_dataset(config):
+        """
+        Create a DualAugmentDataset for self-supervised distillation.
+
+        Returns dataset that yields (clean_img, augmented_img, target) tuples.
+        - clean_img: Minimal preprocessing for teacher (DINOv2)
+        - augmented_img: Full augmentation for student (DeiT)
+        - target: Integer class label (MixUp applied in training loop)
+
+        Args:
+            config: Configuration object
+
+        Returns:
+            DualAugmentDataset instance
+        """
+        dataset_name = config.data.dataset
+
+        # Get raw dataset without transforms
+        if dataset_name == 'mnist':
+            base_dataset = datasets.MNIST(
+                root=config.data.data_path,
+                train=True,
+                download=True,
+                transform=None  # Raw PIL images
+            )
+        elif dataset_name == 'cifar':
+            base_dataset = datasets.CIFAR10(
+                root=config.data.data_path,
+                train=True,
+                download=True,
+                transform=None  # Raw PIL images
+            )
+        elif dataset_name == 'fashion_mnist':
+            base_dataset = datasets.FashionMNIST(
+                root=config.data.data_path,
+                train=True,
+                download=True,
+                transform=None
+            )
+        elif dataset_name == 'svhn':
+            base_dataset = datasets.SVHN(
+                root=config.data.data_path,
+                split='train',
+                download=True,
+                transform=None
+            )
+        else:
+            from torchvision.datasets import ImageFolder
+            data_dir = f"{config.data.data_path}/{dataset_name}"
+            base_dataset = ImageFolder(
+                root=f"{data_dir}/train",
+                transform=None
+            )
+
+        # Get transforms
+        clean_transform = DatasetManager.get_clean_transform(config)
+        student_transform = DatasetManager.get_transforms(config, is_train=True)
+
+        # Create dual augment dataset
+        dual_dataset = DualAugmentDataset(
+            base_dataset=base_dataset,
+            clean_transform=clean_transform,
+            student_transform=student_transform
+        )
+
+        logger.info(
+            f"Created DualAugmentDataset for {dataset_name}: "
+            f"{len(dual_dataset)} samples (clean + augmented paths)"
+        )
+
+        return dual_dataset
+
+    @staticmethod
+    def create_dual_augment_loaders(config, val_split=0.1):
+        """
+        Create data loaders for dual-path augmentation training.
+
+        Returns train_loader that yields (clean_imgs, augmented_imgs, targets).
+
+        Args:
+            config: Configuration object
+            val_split: Fraction for validation set
+
+        Returns:
+            train_loader, val_loader, test_loader
+        """
+        # Get dual augment training dataset
+        full_train_dataset = DatasetManager.get_dual_augment_dataset(config)
+
+        # Split into train/val
+        train_size = int((1 - val_split) * len(full_train_dataset))
+        val_size = len(full_train_dataset) - train_size
+        train_dataset, val_dataset = random_split(
+            full_train_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(config.seed)
+        )
+
+        # Test dataset uses standard single-path transform
+        test_dataset = DatasetManager.get_dataset(config, is_train=False)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=True,
+            num_workers=config.data.num_workers,
+            pin_memory=config.data.pin_memory,
+            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2,
+            drop_last=True
+        )
+
+        # Validation uses clean transform only (single path)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=False,
+            num_workers=config.data.num_workers,
+            pin_memory=config.data.pin_memory,
+            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
+            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=False,
+            num_workers=config.data.num_workers,
+            pin_memory=config.data.pin_memory
+        )
+
+        logger.info(
+            f"Created dual-augment data loaders - Train: {len(train_dataset)}, "
+            f"Val: {len(val_dataset)}, Test: {len(test_dataset)}"
+        )
+
+        return train_loader, val_loader, test_loader
+
 
 def preprocess_image(image_path, config):
     image = Image.open(image_path)

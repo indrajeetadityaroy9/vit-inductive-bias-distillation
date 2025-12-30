@@ -1,0 +1,71 @@
+# ConvNeXt V2-Tiny CIFAR-10 Teacher Configuration
+# EXP-2 Teacher: Modern CNN Bridge (Transformer-like macro architecture)
+# Uses ImageNet pretrained weights with reinitialized stem
+# Target accuracy: >95%
+
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    auto_augment: true
+    cutout: true
+    cutmix: true
+    cutmix_alpha: 1.0
+  batch_size: 512       # Per GPU - H100 optimized
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2470, 0.2435, 0.2616]
+  num_workers: 16
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+device: cuda
+experiment_name: convnext_v2_cifar_teacher
+output_dir: ./outputs/convnext_v2_cifar
+
+seed: 42
+
+model:
+  model_type: convnext_v2_tiny
+  in_channels: 3
+  num_classes: 10
+  pretrained: true      # Use ImageNet pretrained weights
+  drop_path_rate: 0.1   # Stochastic depth
+
+training:
+  num_epochs: 100       # Fewer epochs - pretrained backbone
+  learning_rate: 0.001  # Lower LR for fine-tuning
+  weight_decay: 0.05    # Higher for ConvNeXt
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 15
+  early_stopping_min_delta: 0.001
+  label_smoothing: 0.1
+  use_swa: true
+  swa_start_epoch: 0.75
+  swa_lr: 0.0001
+  lr_scheduler_params:
+    T_max: 100
+    eta_min: 0.000001
+  # H100 optimizations
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true
+
+logging:
+  log_dir: ./logs/convnext_v2_cifar
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false

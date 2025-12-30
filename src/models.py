@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import logging
 
 from src.vit import DeiT
+from src.teachers import ResNet18CIFAR, ConvNeXtV2Tiny, HAS_TIMM
 
 logger = logging.getLogger(__name__)
 
@@ -211,16 +212,33 @@ class AdaptiveCNN(nn.Module):
         return x
 
 class ModelFactory:
+    """
+    Factory for creating model instances.
+
+    Registered models:
+    - adaptive_cnn: AdaptiveCNN (original teacher, SE blocks)
+    - deit: DeiT (Vision Transformer student)
+    - resnet18_cifar: ResNet-18 adapted for CIFAR (classic CNN control)
+    - convnext_v2_tiny: ConvNeXt V2-Tiny (modern CNN bridge) - requires timm
+    """
 
     _models = {
         'adaptive_cnn': AdaptiveCNN,
         'deit': DeiT,
+        'resnet18_cifar': ResNet18CIFAR,
     }
+
+    # Register ConvNeXt V2 only if timm is available
+    if HAS_TIMM:
+        _models['convnext_v2_tiny'] = ConvNeXtV2Tiny
 
     @classmethod
     def create_model(cls, model_name, config):
         if model_name not in cls._models:
-            raise ValueError(f"Unknown model: {model_name}")
+            available = list(cls._models.keys())
+            raise ValueError(
+                f"Unknown model: {model_name}. Available: {available}"
+            )
 
         model_class = cls._models[model_name]
         return model_class(config)
@@ -228,3 +246,8 @@ class ModelFactory:
     @classmethod
     def register_model(cls, name, model_class):
         cls._models[name] = model_class
+
+    @classmethod
+    def list_models(cls):
+        """Return list of available model names."""
+        return list(cls._models.keys())

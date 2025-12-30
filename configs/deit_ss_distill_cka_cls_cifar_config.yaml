@@ -1,0 +1,124 @@
+# DeiT with DINOv2 CKA Structural Distillation - CLS-Only Mode
+# EXP-3b: Refined self-supervised structural distillation
+# Key changes: CLS-only CKA, bicubic upsampling, denser layer selection
+# Expected: >90.2% accuracy (beat supervised teachers)
+
+data:
+  augmentation:
+    random_crop: true
+    random_flip: true
+    auto_augment: true
+    cutout: true
+    # NOTE: MixUp/CutMix applied in training loop AFTER unpacking dual-path batch
+    cutmix: false       # Handled in training loop
+    mixup: false        # Handled in training loop
+  batch_size: 512       # Per GPU - leaves room for DINOv2 teacher
+  data_path: ./data
+  dataset: cifar
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2470, 0.2435, 0.2616]
+  num_workers: 16
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+device: cuda
+experiment_name: deit_dinov2_cka_cls
+output_dir: ./outputs/deit_dinov2_cka_cls
+
+seed: 42
+
+model:
+  model_type: deit
+  in_channels: 3
+  num_classes: 10
+  dropout: 0.1
+
+# DeiT-Tiny configuration
+vit:
+  variant: tiny
+  img_size: 32
+  patch_size: 4
+  embed_dim: 192
+  depth: 12
+  num_heads: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  distillation: true    # Enable distillation token
+  convert_grayscale: false
+  inference_mode: avg   # Use average of cls and dist tokens
+
+training:
+  num_epochs: 200
+  learning_rate: 0.0005   # Lower for distillation stability
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 10
+  gradient_clip_val: 1.0
+  gradient_accumulation_steps: 1
+  use_amp: true
+  amp_backend: native
+  early_stopping: true
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.001
+  label_smoothing: 0.1
+  use_swa: false          # Disabled to avoid SWA bug with fused optimizer
+  lr_scheduler_params:
+    T_max: 200
+    eta_min: 0.000001
+  # H100 optimizations
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  use_fused_optimizer: true
+  use_tf32: true
+
+# Self-supervised distillation with CKA structural loss (CLS-only mode)
+ss_distillation:
+  # Teacher settings (DINOv2-S/14)
+  teacher_type: dinov2
+  teacher_model_name: dinov2_vits14
+  teacher_embed_dim: 384
+
+  # CLS-only mode: Use global CLS token instead of noisy patch interpolation
+  use_cls_only: true
+
+  # Token representation distillation (denser semantic layers)
+  token_layers: [8, 9, 10, 11]   # Dense semantic block (last 4 layers)
+  projection_dim: 256
+  lambda_tok: 0.5
+  token_loss_type: cosine
+
+  # Token correlation distillation
+  lambda_rel: 0.05                 # Light regularizer
+  correlation_temperature: 0.1
+  correlation_loss_type: kl
+  use_pooled_correlation: true
+  rel_warmup_epochs: 10
+
+  # CKA structural loss (PRIMARY - increased weight for CLS mode)
+  use_cka_loss: true
+  lambda_cka: 1.0                  # Increased: cleaner CLS signal supports higher weight
+  cka_kernel_type: linear
+  cka_warmup_epochs: 5
+
+  # Gram matrix loss (disabled)
+  use_gram_loss: false
+  lambda_gram: 0.0
+
+  # Dual-path augmentation (clean for teacher, augmented for student)
+  use_dual_augment: true
+
+  # Projector warmup (optional)
+  projector_warmup_epochs: 0
+
+logging:
+  log_dir: ./logs/deit_dinov2_cka_cls
+  log_level: INFO
+  save_frequency: 10
+  track_grad_norm: true
+  wandb: false

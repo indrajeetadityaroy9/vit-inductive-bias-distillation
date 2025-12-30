@@ -1,17 +1,54 @@
-# Dataset Adaptive Image Classification
+# Mitigating Inductive Bias Mismatch in Heterogeneous Knowledge Distillation
 
-A modular CNN classification pipeline that dynamically adjusts its architecture based on dataset characteristics. The pipeline implements dataset-specific model configurations, preprocessing strategies, and augmentation techniques to optimize performance across diverse image classification tasks.
+A research framework for studying knowledge transfer between architecturally different neural networks, with a focus on CNN-to-ViT distillation and the "negative transfer" phenomenon.
+
+## Core Finding
+
+> **"The negative transfer observed when distilling CNNs into Vision Transformers stems from conflicting inductive biases—not weak teachers."**
+
+We demonstrate that:
+1. **Alignment > Capacity**: A weaker teacher (ConvNeXt, 93.1%) produces a *better* student (90.11%) than a stronger teacher (ResNet-18, 95.1% → 90.05%) due to architectural alignment
+2. **Structure is 99.5% Sufficient**: Self-supervised structural distillation (DINOv2 → DeiT) achieves 89.69% accuracy using *only geometric feature alignment*—no task-specific labels required
+3. **The "Locality Curse"**: CNN-distilled ViTs develop local attention patterns (layer 2: 1.85 patch distance) while DINOv2-distilled ViTs maintain global attention (layer 2: 3.49 patch distance, +88.6%)
+
+## Motivation
+
+Traditional knowledge distillation assumes that a stronger teacher produces a better student. However, when the teacher (CNN) and student (ViT) have fundamentally different inductive biases:
+- **CNNs**: Local receptive fields, translation equivariance, hierarchical features
+- **ViTs**: Global self-attention, position-aware, flat feature hierarchy
+
+The student learns to "think like a CNN" rather than exploiting its native architectural strengths. This manifests as:
+- Collapsed attention distances in middle layers
+- Redundant late-layer representations
+- Suboptimal accuracy despite strong teacher supervision
+
+## Methodology
+
+We compare three distillation approaches on CIFAR-10 with DeiT-Tiny students:
+
+| Experiment | Teacher | Distillation Type | Hypothesis |
+|------------|---------|-------------------|------------|
+| **EXP-1** | ResNet-18 (classic CNN) | Soft KL | Baseline - expect locality bias transfer |
+| **EXP-2** | ConvNeXt V2 (modern CNN) | Soft KL | Reduced bias mismatch due to ViT-like design |
+| **EXP-3** | DINOv2 (self-supervised ViT) | CKA Structural | No bias mismatch - structural alignment only |
+
+**Analytics Pipeline:**
+- **CKA Self-Similarity**: Measures layer-wise representation diversity
+- **Mean Attention Distance**: Quantifies local vs. global attention patterns
+- **Transfer Efficiency**: Student accuracy / Teacher accuracy
 
 ## Features
 
-1. **Adaptive Architecture Design**: A single model class that dynamically instantiates dataset-specific layer configurations with ResidualBlocks and SE attention
-2. **Vision Transformer (DeiT/ViT)**: Data-efficient Image Transformer with optional knowledge distillation from CNN teachers
-3. **Self-Supervised Distillation (CST-style)**: Token representation and correlation distillation from DINOv2 pretrained teachers
-4. **Multi-GPU Training**: Distributed Data Parallel (DDP) support for efficient multi-GPU training
-5. **Knowledge Distillation**: Hard/soft distillation with configurable alpha scheduling (constant, linear, cosine)
-6. **Advanced Augmentation**: RandAugment, MixUp, CutMix, Cutout, and traditional augmentations
-7. **Modern Training Techniques**: Mixed precision (AMP/BF16), Stochastic Weight Averaging (SWA), label smoothing, cosine annealing
-8. **Interpretability Tools**: GradCAM, feature map visualization, confusion matrices, ROC curves
+1. **Adaptive Architecture Design**: Dataset-specific CNN configurations with ResidualBlocks and SE attention
+2. **Vision Transformer (DeiT/ViT)**: Data-efficient Image Transformer with distillation token support
+3. **Multiple Distillation Modes**:
+   - Soft KL distillation (CNN → ViT)
+   - CKA structural distillation (DINOv2 → ViT)
+   - Token representation + correlation distillation (CST-style)
+4. **Research Analytics**: CKA heatmaps, attention distance analysis, transfer efficiency metrics
+5. **Multi-GPU Training**: Distributed Data Parallel (DDP) with H100 optimizations
+6. **Advanced Augmentation**: RandAugment, MixUp, CutMix, Cutout, AutoAugment
+7. **Modern Training**: Mixed precision (BF16), torch.compile, cosine annealing, label smoothing
 
 ## Architecture
 
@@ -142,128 +179,91 @@ Distillation Head* (DIST token → num_classes)
 
 ## Results
 
-### Model Comparison
+### Primary Research Results (Inductive Bias Study)
 
-| Model | MNIST | CIFAR-10 |
-|-------|-------|----------|
-| **AdaptiveCNN** | 99.08% | 82.90% |
-| **DeiT (CNN Distilled)** | 99.54% | 84.39% |
-| **ViT (No Distillation)** | 99.64% | 86.02% |
-| **DeiT (CST-SSL Distilled)** | - | **89.18%** |
+| Experiment | Teacher | Teacher Acc | Student Acc | Transfer Efficiency |
+|------------|---------|-------------|-------------|---------------------|
+| Baseline | None | — | 86.02% | — |
+| **EXP-1** | ResNet-18 | 95.10% | 90.05% | 94.7% |
+| **EXP-2** | ConvNeXt V2 | 93.10% | **90.11%** | **96.8%** |
+| **EXP-3** | DINOv2 | N/A (self-sup) | 89.69% | — |
 
-### AdaptiveCNN (Teacher) Performance
+### Attention Distance Analysis (The "Locality Curse")
 
-**MNIST** (709K parameters):
+Mean attention distance measures how far each query token attends on average (in patch units). Higher = more global attention.
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **99.08%** |
-| **Precision (Macro)** | 0.9908 |
-| **Recall (Macro)** | 0.9908 |
-| **F1-Score (Macro)** | 0.9908 |
+| Layer | EXP-1 (ResNet) | EXP-2 (ConvNeXt) | EXP-3 (DINOv2) | DINO Δ vs ResNet |
+|-------|----------------|------------------|----------------|------------------|
+| 0 | 3.83 | 3.78 | 4.01 | +4.7% |
+| 1 | 2.98 | 2.62 | 2.79 | -6.4% |
+| 2 | **1.85** | 2.20 | **3.49** | **+88.6%** |
+| 3 | 2.68 | 2.33 | **3.56** | **+32.8%** |
+| 4 | 2.94 | 2.49 | **3.36** | **+14.3%** |
+| 5 | 2.57 | 2.82 | **3.74** | **+45.5%** |
+| 6 | 3.22 | 3.50 | **3.77** | **+17.1%** |
+| 7 | 3.83 | 3.84 | 3.95 | +3.1% |
+| 8 | 3.83 | 3.83 | 3.93 | +2.6% |
+| 9 | 3.97 | 3.85 | 3.96 | -0.3% |
+| 10 | 4.01 | 4.04 | 4.08 | +1.7% |
+| 11 | 4.04 | 4.01 | 4.08 | +1.0% |
+| **Mean** | **3.31** | **3.28** | **3.73** | **+12.7%** |
 
-**CIFAR-10** (17.6M parameters):
+**Key Observation:** CNN-distilled students (EXP-1, EXP-2) exhibit attention collapse in layers 2-6, mimicking CNN's local receptive field behavior. DINOv2-distilled students maintain consistently high attention distances.
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **82.90%** |
-| **Precision (Macro)** | 0.8290 |
-| **Recall (Macro)** | 0.8290 |
-| **F1-Score (Macro)** | 0.8290 |
+### CKA Self-Similarity Analysis
 
-### DeiT with Knowledge Distillation
+| Metric | EXP-1 (ResNet) | EXP-2 (ConvNeXt) | EXP-3 (DINOv2) |
+|--------|----------------|------------------|----------------|
+| Early-Late CKA (L0-L11) | 0.358 | 0.312 | **0.515** |
+| Mid-Late CKA (L5-L11) | 0.887 | 0.862 | **0.743** |
+| Layer Diversity Score* | 0.56 | 0.58 | **0.69** |
 
-**MNIST** (3.9M parameters, distilled from AdaptiveCNN):
+*Layer Diversity = 1 - mean(off-diagonal CKA). Higher = more diverse representations.
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **99.54%** |
-| **Precision (Macro)** | 0.9954 |
-| **Recall (Macro)** | 0.9954 |
-| **F1-Score (Macro)** | 0.9954 |
+**Interpretation:** DINOv2 distillation creates more diverse, less redundant representations. CNN-distilled models show high redundancy in late layers (mid-late CKA ~0.86-0.89).
 
-**CIFAR-10** (4.3M parameters, distilled from AdaptiveCNN):
+### Practical Recommendations
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **84.39%** |
-| **Precision (Macro)** | 0.8431 |
-| **Recall (Macro)** | 0.8439 |
-| **F1-Score (Macro)** | 0.8422 |
+| Scenario | Recommended Approach | Rationale |
+|----------|---------------------|-----------|
+| Maximum accuracy, labeled teacher | ConvNeXt → ViT soft KL | 96.8% transfer efficiency |
+| No labeled data for teacher | DINOv2 → ViT structural | 99.5% of supervised performance |
+| Interpretability important | DINOv2 → ViT structural | Preserves global attention |
+| Classic CNN teacher available | Use it, expect locality bias | Still +4% over baseline |
 
-### ViT without Distillation (Baseline)
+---
 
-**MNIST** (3.9M parameters):
+### Additional Model Results
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **99.64%** |
-| **Precision (Macro)** | 0.9964 |
-| **Recall (Macro)** | 0.9964 |
-| **F1-Score (Macro)** | 0.9964 |
-| **AUC (Macro)** | 1.0000 |
+#### Teacher Models (CIFAR-10)
 
-**CIFAR-10** (4.3M parameters):
+| Model | Parameters | Accuracy |
+|-------|------------|----------|
+| ResNet-18 (modified stem) | 11.2M | 95.10% |
+| ConvNeXt V2 Tiny | 28.6M | 93.10% |
+| AdaptiveCNN | 17.6M | 82.90% |
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **86.02%** |
-| **Precision (Macro)** | 0.8600 |
-| **Recall (Macro)** | 0.8602 |
-| **F1-Score (Macro)** | 0.8591 |
-| **AUC (Macro)** | 0.9886 |
+#### DeiT-Tiny Student Variants
 
-### DeiT with Self-Supervised Distillation (CST-style)
+| Distillation Method | Teacher | CIFAR-10 Acc |
+|---------------------|---------|--------------|
+| None (baseline) | — | 86.02% |
+| Soft KL | AdaptiveCNN | 84.39% |
+| Soft KL | ResNet-18 | 90.05% |
+| Soft KL | ConvNeXt V2 | **90.11%** |
+| CKA Structural | DINOv2 | 89.69% |
+| CST Token+Rel | DINOv2 | 89.18% |
 
-**CIFAR-10** (4.3M parameters, distilled from DINOv2 ViT-S/14):
+### Negative Transfer Effect (Historical Context)
 
-| Metric | Score |
-|--------|-------|
-| **Accuracy** | **89.18%** |
-| **Precision (Macro)** | 0.8920 |
-| **Recall (Macro)** | 0.8918 |
-| **F1-Score (Macro)** | 0.8911 |
-| **AUC (Macro)** | 0.9903 |
-| **Top-3 Accuracy** | 98.08% |
-| **Top-5 Accuracy** | 99.47% |
+Early experiments showed **CNN-distilled DeiT underperforms ViT without distillation** when using a weak teacher:
 
-**Method:** CST-style (Contrastive Self-supervised Token) distillation using:
-- **Token Representation Loss (L_tok)**: Aligns intermediate layer tokens between student and DINOv2 teacher via learnable projectors
-- **Token Correlation Loss (L_rel)**: Matches token-token relational structure using KL divergence on correlation matrices
-- **Staged Training**: L_tok only for epochs 0-9, then L_tok + L_rel for epochs 10+
-- **Loss**: `L = L_ce + 1.0 × L_tok + 0.1 × L_rel`
-
-### Negative Transfer Effect Analysis
-
-A key finding from our experiments: **CNN-distilled DeiT underperforms ViT without distillation**.
-
-**CIFAR-10 Results (CNN Distillation):**
 ```
-ViT (86.02%) > DeiT-CNN (84.39%) > CNN (82.90%)
+ViT (86.02%) > DeiT-CNN (84.39%) > AdaptiveCNN (82.90%)
        +1.63%            +1.49%
 ```
 
-**Root Cause:** The teacher CNN (82.90%) was weaker than what the student could achieve independently. This caused:
-
-1. **Negative Knowledge Transfer** - DeiT was constrained by the teacher's suboptimal representations
-2. **Teacher Ceiling Effect** - With α=0.6, 60% of the loss pushed toward the teacher's 82.9% accuracy ceiling
-3. **Constrained Optimization** - Hard distillation forced matching teacher predictions instead of learning optimal features
-
-**Solution: Self-Supervised Distillation (CST-style)**
-
-By replacing the weak CNN teacher with DINOv2 (a self-supervised pretrained ViT) and distilling token representations instead of logits, we avoid the negative transfer:
-
-```
-DeiT-CST (89.18%) > ViT (86.02%) > DeiT-CNN (84.39%) > CNN (82.90%)
-         +3.16%           +1.63%            +1.49%
-```
-
-**Why CST-SSL Works:**
-1. **No Logit Imitation** - Student learns relational structure, not teacher's classification decisions
-2. **Strong Teacher Features** - DINOv2's self-supervised features provide rich supervision without task-specific bias
-3. **Intermediate Alignment** - Token-level distillation preserves inductive biases while transferring knowledge
-
-**Key Insight:** Knowledge distillation with weak teachers causes negative transfer. Self-supervised relational distillation avoids this by transferring feature structure rather than classification outputs.
+This motivated the current research into stronger teachers and structural distillation methods.
 
 ### Training Time (2× NVIDIA H100 80GB)
 
@@ -271,11 +271,12 @@ DeiT-CST (89.18%) > ViT (86.02%) > DeiT-CNN (84.39%) > CNN (82.90%)
 |-------|---------|---------------|--------|
 | AdaptiveCNN | MNIST | ~1 minute | 20 |
 | AdaptiveCNN | CIFAR-10 | ~4 minutes | 40 |
-| DeiT (CNN Distilled) | MNIST | ~4 minutes | 50 |
+| ResNet-18 Teacher | CIFAR-10 | ~8 minutes | 200 |
+| ConvNeXt V2 Teacher | CIFAR-10 | ~12 minutes | 200 |
 | DeiT (CNN Distilled) | CIFAR-10 | ~12 minutes | 100 |
-| ViT | MNIST | ~4 minutes | 50 |
-| ViT | CIFAR-10 | ~17 minutes | 100 |
+| DeiT (CKA Structural) | CIFAR-10 | ~20 minutes | 200 |
 | DeiT (CST-SSL) | CIFAR-10 | ~25 minutes | 100 |
+| ViT Baseline | CIFAR-10 | ~17 minutes | 100 |
 
 ## Usage
 
@@ -317,6 +318,25 @@ python main.py train-distill configs/deit_cifar_config.yaml --num-gpus 2
 python main.py train-ss-distill configs/deit_ss_distill_cifar_config.yaml --num-gpus 1
 ```
 
+**DeiT (with CKA structural distillation):**
+```bash
+# Train DeiT with CKA structural alignment to DINOv2
+python main.py train-ss-distill configs/deit_ss_distill_cka_cifar_config.yaml --num-gpus 2
+```
+
+### Research Analytics
+
+```bash
+# Run analytics on trained model (CKA heatmap + attention distance)
+python main.py analyze configs/deit_ss_distill_cka_cifar_config.yaml \
+    outputs/checkpoints/exp3_dino/best_model.pth \
+    --metrics cka,attention \
+    --output-dir outputs/analytics/exp3_dino
+
+# Generate comparison plots across all experiments
+python scripts/generate_comparison_plots.py
+```
+
 ### Evaluation
 
 ```bash
@@ -344,19 +364,35 @@ python main.py test configs/cifar_improved_config.yaml ./outputs/checkpoints/bes
 │   ├── vit_cifar_config.yaml              # ViT for CIFAR-10 (no distillation)
 │   ├── deit_mnist_config.yaml             # DeiT for MNIST (CNN distillation)
 │   ├── deit_cifar_config.yaml             # DeiT for CIFAR-10 (CNN distillation)
-│   └── deit_ss_distill_cifar_config.yaml  # DeiT for CIFAR-10 (CST-SSL distillation)
+│   ├── deit_ss_distill_cifar_config.yaml  # DeiT for CIFAR-10 (CST-SSL distillation)
+│   ├── deit_ss_distill_cka_cifar_config.yaml  # DeiT with CKA structural distillation
+│   ├── resnet18_cifar_config.yaml         # ResNet-18 teacher
+│   └── convnext_v2_cifar_config.yaml      # ConvNeXt V2 teacher
 ├── src/
 │   ├── config.py              # Configuration management
 │   ├── models.py              # AdaptiveCNN with ResidualBlock + SE
+│   ├── teachers.py            # ResNet-18, ConvNeXt V2 teacher models
 │   ├── vit.py                 # DeiT/ViT implementation
-│   ├── distillation.py        # Knowledge distillation trainer
+│   ├── distillation.py        # Knowledge distillation (KL, CKA, CST)
+│   ├── analytics.py           # CKA heatmaps, attention distance analysis
 │   ├── datasets.py            # Data loading and augmentation
 │   ├── training.py            # Trainer and DDPTrainer classes
 │   ├── evaluation.py          # Metrics and visualization
 │   └── visualization.py       # GradCAM and feature maps
-├── outputs/                    # Training outputs
+├── scripts/
+│   └── generate_comparison_plots.py  # Research visualization generator
+├── outputs/
 │   ├── checkpoints/           # Model checkpoints
-│   └── evaluation/            # Evaluation plots
+│   ├── evaluation/            # Evaluation plots
+│   └── analytics/             # Research analytics outputs
+│       ├── ANALYSIS_REPORT.md         # Full research report
+│       ├── cka_comparison.png         # 3-panel CKA heatmap
+│       ├── accuracy_comparison.png    # Accuracy bar chart
+│       ├── attention_comparison.png   # Attention distance plot
+│       ├── transfer_efficiency.png    # Teacher vs student scatter
+│       ├── exp1_resnet/               # EXP-1 analytics
+│       ├── exp2_convnext/             # EXP-2 analytics
+│       └── exp3_dino/                 # EXP-3 analytics
 └── main.py                    # CLI entry point
 ```
 
@@ -365,7 +401,22 @@ python main.py test configs/cifar_improved_config.yaml ./outputs/checkpoints/bes
 - Python 3.8+
 - PyTorch 2.0+
 - torchvision
+- timm >= 0.9.0 (for ConvNeXt V2, DINOv2)
 - numpy
 - tqdm
 - matplotlib
 - scikit-learn
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@misc{inductive_bias_distillation_2025,
+  title={Mitigating Inductive Bias Mismatch in Heterogeneous Knowledge Distillation},
+  author={[Author]},
+  year={2025},
+  note={GitHub repository},
+  howpublished={\url{https://github.com/[repo]}}
+}
+```

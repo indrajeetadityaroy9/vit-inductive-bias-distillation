@@ -31,7 +31,8 @@ from src.datasets import DatasetManager, preprocess_image
 from src.evaluation import ModelEvaluator, TestTimeAugmentation
 from src.training import DDPTrainer
 from src.distillation import DistillationTrainer, SelfSupervisedDistillationTrainer, load_dino_teacher
-from src.visualization import FeatureMapVisualizer, GradCAM, TrainingVisualizer
+from src.visualization import FeatureMapVisualizer, GradCAM, TrainingVisualizer, AnalyticsVisualizer
+from src.analytics import AnalyticsRunner
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +53,8 @@ def train_worker(
     config_path: str
 ):
     """DDP training worker for a single GPU process."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
@@ -326,7 +327,7 @@ def train_distill_worker(
 ):
     """DDP training worker for DeiT distillation training."""
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29501'  # Different port from regular training
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29501')  # Use env or default
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
@@ -710,7 +711,16 @@ def train_ss_distill_worker(
         )
 
         # Create data loaders
-        train_dataset = DatasetManager.get_dataset(config, is_train=True)
+        # Use dual-augment loaders if enabled (clean for teacher, augmented for student)
+        use_dual_augment = getattr(config.ss_distillation, 'use_dual_augment', False)
+
+        if use_dual_augment:
+            if is_main_process:
+                logger.info("Using dual-path augmentation (clean for teacher, augmented for student)")
+            train_dataset = DatasetManager.get_dual_augment_dataset(config)
+        else:
+            train_dataset = DatasetManager.get_dataset(config, is_train=True)
+
         val_dataset = DatasetManager.get_dataset(config, is_train=False)
         test_dataset = DatasetManager.get_dataset(config, is_train=False)
 
@@ -1035,6 +1045,173 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
         )
 
 
+def analyze_model(
+    config_path: str,
+    checkpoint_path: str,
+    metrics: str = 'all',
+    output_dir: str = None,
+    num_samples: int = 1024
+):
+    """
+    Run research-grade analytics on a trained model.
+
+    Computes:
+    - Hessian trace and top eigenvalues (loss landscape curvature)
+    - Mean attention distance per layer (for ViT models)
+    - CKA similarity matrix (layer-wise representations)
+
+    Args:
+        config_path: Path to model configuration file
+        checkpoint_path: Path to model checkpoint
+        metrics: Comma-separated list of metrics ('hessian', 'attention', 'cka', or 'all')
+        output_dir: Directory to save results (default: outputs/analytics)
+        num_samples: Number of samples for analysis
+    """
+    import json
+
+    config = ConfigManager.load_config(config_path)
+    setup_logging(config.logging)
+
+    device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Running analytics on device: {device}")
+
+    # Get dataset info
+    dataset_info = DatasetManager.get_dataset_info(config)
+    config.model.in_channels = dataset_info['in_channels']
+    config.model.num_classes = dataset_info['num_classes']
+    config.model.dataset = config.data.dataset
+
+    # Build model config (merge model and vit configs for DeiT)
+    model_config = config.model.__dict__.copy()
+    if hasattr(config, 'vit') and config.vit is not None:
+        model_config.update(config.vit.__dict__)
+
+    # Create model
+    model = ModelFactory.create_model(config.model.model_type, model_config)
+    model = model.to(device)
+
+    # Load checkpoint
+    if hasattr(torch.serialization, 'add_safe_globals'):
+        torch.serialization.add_safe_globals([
+            Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
+            ViTConfig, DistillationConfig, SelfSupervisedDistillationConfig
+        ])
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    logger.info(f"Loaded model from {checkpoint_path}")
+
+    # Unwrap compiled model if necessary (CRITICAL for Hessian)
+    if hasattr(model, '_orig_mod'):
+        logger.info("Unwrapping torch.compile model for analytics")
+        model = model._orig_mod
+
+    # Parse metrics
+    if metrics.lower() == 'all':
+        metric_list = ['hessian', 'attention', 'cka']
+    else:
+        metric_list = [m.strip().lower() for m in metrics.split(',')]
+
+    logger.info(f"Analytics metrics to compute: {metric_list}")
+
+    # Create data loader for analytics
+    test_dataset = DatasetManager.get_dataset(config, is_train=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=64,  # Smaller batch for Hessian stability
+        shuffle=True,  # Random samples
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory
+    )
+
+    # Set up output directory
+    if output_dir is None:
+        output_dir = Path(config.output_dir) / 'analytics'
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Add config parameters for analytics
+    class AnalyticsConfig:
+        def __init__(self, config, num_samples):
+            self.hessian_samples = num_samples
+            self.cka_kernel = 'linear'
+            # Copy vit config if available
+            if hasattr(config, 'vit') and config.vit is not None:
+                self.vit = config.vit
+            else:
+                self.vit = None
+
+    analytics_config = AnalyticsConfig(config, num_samples)
+
+    # Run analytics
+    runner = AnalyticsRunner(
+        model=model,
+        config=analytics_config,
+        device=device,
+        teacher_model=None  # Could add teacher for comparison
+    )
+
+    results = runner.run_all(
+        dataloader=test_loader,
+        metrics=metric_list,
+        save_path=output_dir / 'analytics_results.json'
+    )
+
+    # Generate visualizations
+    logger.info("=" * 60)
+    logger.info("Generating Analytics Visualizations")
+    logger.info("=" * 60)
+
+    # CKA Heatmap
+    if 'cka' in results and 'cka_matrix' in results['cka']:
+        AnalyticsVisualizer.plot_cka_heatmap(
+            cka_matrix=results['cka']['cka_matrix'],
+            layer_indices_x=results['cka'].get('layer_indices_1'),
+            layer_indices_y=results['cka'].get('layer_indices_2'),
+            title=f"CKA Similarity - {config.experiment_name}",
+            save_path=output_dir / 'cka_heatmap.png'
+        )
+
+    # Attention Distance
+    if 'attention' in results and 'layer_distances' in results['attention']:
+        AnalyticsVisualizer.plot_attention_distances(
+            layer_distances=results['attention']['layer_distances'],
+            title=f"Mean Attention Distance - {config.experiment_name}",
+            save_path=output_dir / 'attention_distances.png'
+        )
+
+    # Print summary
+    logger.info("=" * 60)
+    logger.info("ANALYTICS SUMMARY")
+    logger.info("=" * 60)
+
+    if 'hessian' in results:
+        hessian = results['hessian']
+        if 'trace' in hessian:
+            logger.info(f"Hessian Trace: {hessian['trace']:.4f} +/- {hessian.get('trace_std', 0):.4f}")
+        if 'max_eigenvalue' in hessian:
+            logger.info(f"Max Eigenvalue: {hessian['max_eigenvalue']:.4f}")
+        if 'eigenvalue_ratio' in hessian:
+            logger.info(f"Eigenvalue Ratio: {hessian['eigenvalue_ratio']:.2f}")
+
+    if 'attention' in results and 'mean_distance' in results['attention']:
+        logger.info(f"Mean Attention Distance: {results['attention']['mean_distance']:.4f}")
+
+    if 'cka' in results and 'cka_matrix' in results['cka']:
+        cka_matrix = np.array(results['cka']['cka_matrix'])
+        diagonal_mean = np.diag(cka_matrix).mean() if cka_matrix.shape[0] == cka_matrix.shape[1] else 0
+        logger.info(f"CKA Diagonal Mean: {diagonal_mean:.4f}")
+
+    logger.info("=" * 60)
+    logger.info(f"Analytics results saved to: {output_dir}")
+    logger.info("=" * 60)
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Adaptive CNN Training System',
@@ -1071,6 +1248,19 @@ def main():
     ss_distill_parser.add_argument('--num-gpus', type=int, default=1,
                                    help='Number of GPUs to use (default: 1)')
 
+    analyze_parser = subparsers.add_parser(
+        'analyze',
+        help='Run research-grade analytics on a trained model (Hessian, Attention Distance, CKA)'
+    )
+    analyze_parser.add_argument('config', type=str, help='Path to configuration file')
+    analyze_parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
+    analyze_parser.add_argument('--metrics', type=str, default='all',
+                               help='Comma-separated metrics: hessian,attention,cka or all (default: all)')
+    analyze_parser.add_argument('--output-dir', type=str, default=None,
+                               help='Output directory for results (default: outputs/analytics)')
+    analyze_parser.add_argument('--num-samples', type=int, default=1024,
+                               help='Number of samples for Hessian analysis (default: 1024)')
+
     args = parser.parse_args()
 
     if args.command == 'train':
@@ -1083,6 +1273,14 @@ def main():
         evaluate_model(args.config, args.checkpoint)
     elif args.command == 'test':
         test_single_image(args.config, args.checkpoint, args.image, args.tta)
+    elif args.command == 'analyze':
+        analyze_model(
+            args.config,
+            args.checkpoint,
+            metrics=args.metrics,
+            output_dir=args.output_dir,
+            num_samples=args.num_samples
+        )
     else:
         parser.print_help()
 
