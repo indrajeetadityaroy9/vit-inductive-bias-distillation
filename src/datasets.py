@@ -37,10 +37,24 @@ class Cutout:
 
         return img
 
-class MixUpDataset(Dataset):
+class MixingDataset(Dataset):
+    """
+    Unified MixUp/CutMix augmentation wrapper.
 
-    def __init__(self, dataset, alpha=1.0, num_classes=10):
+    Combines the functionality of MixUpDataset and CutMixDataset into
+    a single class controlled by the mix_type parameter.
+    """
+
+    def __init__(self, dataset, mix_type='mixup', alpha=1.0, num_classes=10):
+        """
+        Args:
+            dataset: Base dataset to wrap
+            mix_type: 'mixup' or 'cutmix'
+            alpha: Beta distribution parameter for mixing ratio
+            num_classes: Number of classes for one-hot encoding
+        """
         self.dataset = dataset
+        self.mix_type = mix_type
         self.alpha = alpha
         self.num_classes = num_classes
 
@@ -54,8 +68,13 @@ class MixUpDataset(Dataset):
         img2, target2 = self.dataset[idx2]
 
         lam = np.random.beta(self.alpha, self.alpha) if self.alpha > 0 else 1
-        img = lam * img1 + (1 - lam) * img2
 
+        if self.mix_type == 'cutmix':
+            img, lam = self._apply_cutmix(img1, img2, lam)
+        else:  # mixup
+            img = lam * img1 + (1 - lam) * img2
+
+        # One-hot encode targets
         target1_oh = torch.zeros(self.num_classes)
         target2_oh = torch.zeros(self.num_classes)
         target1_oh[target1] = 1
@@ -65,40 +84,17 @@ class MixUpDataset(Dataset):
 
         return img, target
 
-class CutMixDataset(Dataset):
-
-    def __init__(self, dataset, alpha=1.0, num_classes=10):
-        self.dataset = dataset
-        self.alpha = alpha
-        self.num_classes = num_classes
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        img1, target1 = self.dataset[idx]
-
-        idx2 = random.randint(0, len(self.dataset) - 1)
-        img2, target2 = self.dataset[idx2]
-
-        lam = np.random.beta(self.alpha, self.alpha) if self.alpha > 0 else 1
+    def _apply_cutmix(self, img1, img2, lam):
+        """Apply CutMix augmentation and return adjusted lambda."""
         bbx1, bby1, bbx2, bby2 = self._rand_bbox(img1.size(), lam)
-
         img = img1.clone()
         img[:, bbx1:bbx2, bby1:bby2] = img2[:, bbx1:bbx2, bby1:bby2]
-
+        # Adjust lambda based on actual cut area
         lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (img1.size()[-1] * img1.size()[-2]))
-
-        target1_oh = torch.zeros(self.num_classes)
-        target2_oh = torch.zeros(self.num_classes)
-        target1_oh[target1] = 1
-        target2_oh[target2] = 1
-
-        target = lam * target1_oh + (1 - lam) * target2_oh
-
-        return img, target
+        return img, lam
 
     def _rand_bbox(self, size, lam):
+        """Generate random bounding box for CutMix."""
         W = size[2]
         H = size[1]
         cut_rat = np.sqrt(1. - lam)
@@ -114,6 +110,11 @@ class CutMixDataset(Dataset):
         bby2 = np.clip(cy + cut_h // 2, 0, H)
 
         return bbx1, bby1, bbx2, bby2
+
+
+# Backward compatibility aliases
+MixUpDataset = lambda dataset, alpha=1.0, num_classes=10: MixingDataset(dataset, 'mixup', alpha, num_classes)
+CutMixDataset = lambda dataset, alpha=1.0, num_classes=10: MixingDataset(dataset, 'cutmix', alpha, num_classes)
 
 
 class DualAugmentDataset(Dataset):
@@ -425,49 +426,6 @@ class DatasetManager:
         }
 
     @staticmethod
-    def get_clean_transform(config):
-        """
-        Get minimal transform for teacher (clean images).
-
-        Only applies resize, to_tensor, and normalization.
-        No augmentation - used for self-supervised teachers like DINOv2.
-        """
-        dataset = config.data.dataset
-        transform_list = []
-
-        if dataset == 'mnist':
-            transform_list.extend([
-                transforms.Resize((28, 28)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization['mean'],
-                    std=config.data.normalization['std']
-                )
-            ])
-        elif dataset == 'cifar':
-            transform_list.extend([
-                transforms.Resize((32, 32)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization['mean'],
-                    std=config.data.normalization['std']
-                )
-            ])
-        else:
-            aug_config = config.data.augmentation
-            size = aug_config.get('image_size', 224)
-            transform_list.extend([
-                transforms.Resize((size, size)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=config.data.normalization.get('mean', [0.485, 0.456, 0.406]),
-                    std=config.data.normalization.get('std', [0.229, 0.224, 0.225])
-                )
-            ])
-
-        return transforms.Compose(transform_list)
-
-    @staticmethod
     def get_dual_augment_dataset(config):
         """
         Create a DualAugmentDataset for self-supervised distillation.
@@ -522,8 +480,8 @@ class DatasetManager:
                 transform=None
             )
 
-        # Get transforms
-        clean_transform = DatasetManager.get_clean_transform(config)
+        # Get transforms - clean uses is_train=False for minimal preprocessing
+        clean_transform = DatasetManager.get_transforms(config, is_train=False)
         student_transform = DatasetManager.get_transforms(config, is_train=True)
 
         # Create dual augment dataset

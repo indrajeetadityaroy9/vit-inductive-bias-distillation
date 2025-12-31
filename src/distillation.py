@@ -18,7 +18,7 @@ from tqdm import tqdm
 import time
 from collections import defaultdict
 
-from src.training import DDPTrainer, LabelSmoothingCrossEntropy
+from src.training import DDPTrainer, LabelSmoothingCrossEntropy, build_checkpoint_dict
 from src.config import (
     Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
     ViTConfig, DistillationConfig
@@ -559,22 +559,17 @@ class DistillationTrainer(DDPTrainer):
         return dict(self.metrics_history)
 
     def save_checkpoint(self, filename, epoch, metrics):
-        """Save checkpoint with distillation-specific information."""
+        """Save checkpoint with distillation-specific information using shared utility."""
         checkpoint_dir = Path(self.config.output_dir) / self.config.experiment_name / 'checkpoints'
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get model state dict (unwrap DDP)
+        # Get model (unwrap DDP)
         model = self.ddp_model.module if hasattr(self.ddp_model, 'module') else self.ddp_model
+        swa_model = self.swa_model if self.use_swa else None
+        scaler = self.scaler if self.use_amp else None
 
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'metrics': metrics,
-            'config': self.config,
-            'best_val_acc': self.best_val_acc,
-            'metrics_history': dict(self.metrics_history),
-            # Distillation-specific info
+        # Distillation-specific metadata
+        extra_metadata = {
             'distillation_config': {
                 'type': self.distillation_type,
                 'alpha': self.distillation_alpha,
@@ -584,14 +579,19 @@ class DistillationTrainer(DDPTrainer):
             }
         }
 
-        if self.scheduler:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-
-        if self.use_amp and self.scaler is not None:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-
-        if self.use_swa:
-            checkpoint['swa_model_state_dict'] = self.swa_model.state_dict()
+        checkpoint = build_checkpoint_dict(
+            model=model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=scaler,
+            swa_model=swa_model,
+            epoch=epoch,
+            metrics=metrics,
+            config=self.config,
+            best_val_acc=self.best_val_acc,
+            metrics_history=self.metrics_history,
+            extra_metadata=extra_metadata
+        )
 
         save_path = checkpoint_dir / filename
         torch.save(checkpoint, save_path)

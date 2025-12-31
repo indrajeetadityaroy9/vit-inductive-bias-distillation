@@ -17,6 +17,149 @@ PYTORCH_VERSION = tuple(int(x) for x in torch.__version__.split('.')[:2])
 HAS_PYTORCH_2 = PYTORCH_VERSION >= (2, 0)
 HAS_PYTORCH_2_1 = PYTORCH_VERSION >= (2, 1)
 
+
+# =============================================================================
+# Utility Functions (Shared across all trainers)
+# =============================================================================
+
+def build_optimizer(model, config, device):
+    """
+    Create optimizer with H100 optimizations.
+
+    Args:
+        model: PyTorch model (unwrapped)
+        config: Config object with training settings
+        device: Target device
+
+    Returns:
+        Configured optimizer
+    """
+    opt_name = config.training.optimizer.lower()
+    lr = config.training.learning_rate
+    wd = config.training.weight_decay
+
+    # Fused optimizers require PyTorch 2.0+ and CUDA
+    use_fused = (config.training.use_fused_optimizer and
+                 device.type == 'cuda' and HAS_PYTORCH_2)
+
+    if not HAS_PYTORCH_2 and config.training.use_fused_optimizer:
+        logger.warning("Fused optimizers require PyTorch 2.0+. Using standard optimizers.")
+
+    if opt_name == 'adam':
+        return optim.Adam(model.parameters(), lr=lr, weight_decay=wd, fused=use_fused)
+    elif opt_name == 'adamw':
+        if use_fused:
+            logger.info("Using fused AdamW optimizer (H100 optimized)")
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, fused=use_fused)
+    elif opt_name == 'sgd':
+        if use_fused:
+            logger.info("Using fused SGD optimizer (H100 optimized)")
+        return optim.SGD(model.parameters(), lr=lr, weight_decay=wd,
+                         momentum=0.9, nesterov=True, fused=use_fused)
+    elif opt_name == 'rmsprop':
+        return optim.RMSprop(model.parameters(), lr=lr, weight_decay=wd)
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_name}")
+
+
+def build_scheduler(optimizer, config):
+    """
+    Create learning rate scheduler.
+
+    Args:
+        optimizer: PyTorch optimizer
+        config: Config object with training settings
+
+    Returns:
+        Configured scheduler or None
+    """
+    scheduler_name = config.training.scheduler.lower()
+    params = config.training.lr_scheduler_params
+
+    if scheduler_name == 'step':
+        return optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=params.get('step_size', 10),
+            gamma=params.get('gamma', 0.1)
+        )
+    elif scheduler_name == 'cosine':
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=params.get('T_max', config.training.num_epochs),
+            eta_min=params.get('eta_min', 0.0001)
+        )
+    elif scheduler_name == 'plateau':
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=params.get('factor', 0.1),
+            patience=params.get('patience', 5),
+            min_lr=params.get('min_lr', 1e-7)
+        )
+    elif scheduler_name == 'exponential':
+        return optim.lr_scheduler.ExponentialLR(
+            optimizer,
+            gamma=params.get('gamma', 0.95)
+        )
+    elif scheduler_name == 'cyclic':
+        return optim.lr_scheduler.CyclicLR(
+            optimizer,
+            base_lr=params.get('base_lr', 0.0001),
+            max_lr=params.get('max_lr', config.training.learning_rate),
+            step_size_up=params.get('step_size_up', 2000),
+            mode=params.get('mode', 'triangular2')
+        )
+    else:
+        return None
+
+
+def build_checkpoint_dict(model, optimizer, scheduler, scaler, swa_model,
+                          epoch, metrics, config, best_val_acc, metrics_history,
+                          extra_metadata=None):
+    """
+    Build checkpoint dictionary with all training state.
+
+    Args:
+        model: PyTorch model (unwrapped from DDP)
+        optimizer: Optimizer
+        scheduler: LR scheduler (optional)
+        scaler: GradScaler (optional)
+        swa_model: SWA model (optional)
+        epoch: Current epoch
+        metrics: Current metrics dict
+        config: Config object
+        best_val_acc: Best validation accuracy
+        metrics_history: Training history
+        extra_metadata: Additional distillation-specific metadata (optional)
+
+    Returns:
+        Checkpoint dictionary
+    """
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'metrics': metrics,
+        'config': config,
+        'best_val_acc': best_val_acc,
+        'metrics_history': dict(metrics_history)
+    }
+
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+
+    if swa_model is not None:
+        checkpoint['swa_model_state_dict'] = swa_model.state_dict()
+
+    if extra_metadata is not None:
+        checkpoint.update(extra_metadata)
+
+    return checkpoint
+
+
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.001, mode='min'):
         self.patience = patience
@@ -84,9 +227,9 @@ class Trainer:
         else:
             self.criterion = nn.CrossEntropyLoss()
 
-        self.optimizer = self._create_optimizer()
-
-        self.scheduler = self._create_scheduler()
+        # Use module-level utilities for optimizer and scheduler
+        self.optimizer = build_optimizer(model, config, device)
+        self.scheduler = build_scheduler(self.optimizer, config)
 
         self.use_amp = config.training.use_amp and device.type == 'cuda'
         self.autocast_kwargs = {}
@@ -147,97 +290,26 @@ class Trainer:
             return True
         return False
 
-    def _create_optimizer(self):
-        opt_name = self.config.training.optimizer.lower()
-        lr = self.config.training.learning_rate
-        wd = self.config.training.weight_decay
-        # Fused optimizers require PyTorch 2.0+ and CUDA
-        use_fused = (self.config.training.use_fused_optimizer and
-                     self.device.type == 'cuda' and HAS_PYTORCH_2)
-
-        if not HAS_PYTORCH_2 and self.config.training.use_fused_optimizer:
-            logger.warning("Fused optimizers require PyTorch 2.0+. Using standard optimizers.")
-
-        if opt_name == 'adam':
-            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd,
-                              fused=use_fused)
-        elif opt_name == 'adamw':
-            if use_fused:
-                logger.info("Using fused AdamW optimizer (H100 optimized)")
-            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd,
-                               fused=use_fused)
-        elif opt_name == 'sgd':
-            if use_fused:
-                logger.info("Using fused SGD optimizer (H100 optimized)")
-            return optim.SGD(self.model.parameters(), lr=lr, weight_decay=wd,
-                             momentum=0.9, nesterov=True, fused=use_fused)
-        elif opt_name == 'rmsprop':
-            return optim.RMSprop(self.model.parameters(), lr=lr, weight_decay=wd)
-        else:
-            raise ValueError(f"Unknown optimizer: {opt_name}")
-
-    def _create_scheduler(self):
-        scheduler_name = self.config.training.scheduler.lower()
-        params = self.config.training.lr_scheduler_params
-
-        if scheduler_name == 'step':
-            return optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=params.get('step_size', 10),
-                gamma=params.get('gamma', 0.1)
-            )
-        elif scheduler_name == 'cosine':
-            return optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=params.get('T_max', self.config.training.num_epochs),
-                eta_min=params.get('eta_min', 0.0001)
-            )
-        elif scheduler_name == 'plateau':
-            return optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer,
-                mode='min',
-                factor=params.get('factor', 0.1),
-                patience=params.get('patience', 5),
-                min_lr=params.get('min_lr', 1e-7)
-            )
-        elif scheduler_name == 'exponential':
-            return optim.lr_scheduler.ExponentialLR(
-                self.optimizer,
-                gamma=params.get('gamma', 0.95)
-            )
-        elif scheduler_name == 'cyclic':
-            return optim.lr_scheduler.CyclicLR(
-                self.optimizer,
-                base_lr=params.get('base_lr', 0.0001),
-                max_lr=params.get('max_lr', self.config.training.learning_rate),
-                step_size_up=params.get('step_size_up', 2000),
-                mode=params.get('mode', 'triangular2')
-            )
-        else:
-            return None
-
     def save_checkpoint(self, filename, epoch, metrics):
+        """Save checkpoint using shared utility."""
         checkpoint_dir = Path(self.config.output_dir) / 'checkpoints'
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'metrics': metrics,
-            'config': self.config,
-            'best_val_acc': self.best_val_acc,
-            'metrics_history': dict(self.metrics_history)
-        }
+        swa_model = self.swa_model if self.use_swa else None
+        scaler = self.scaler if self.use_amp else None
 
-        if self.scheduler:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-
-        if self.use_amp and self.scaler is not None:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-
-        if self.use_swa:
-            checkpoint['swa_model_state_dict'] = self.swa_model.state_dict()
+        checkpoint = build_checkpoint_dict(
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=scaler,
+            swa_model=swa_model,
+            epoch=epoch,
+            metrics=metrics,
+            config=self.config,
+            best_val_acc=self.best_val_acc,
+            metrics_history=self.metrics_history
+        )
 
         save_path = checkpoint_dir / filename
         torch.save(checkpoint, save_path)

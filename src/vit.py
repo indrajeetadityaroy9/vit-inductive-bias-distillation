@@ -444,6 +444,35 @@ class DeiT(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
+    def _prepare_tokens(self, x):
+        """
+        Prepare patch embeddings with class/distillation tokens and positional encoding.
+
+        This is a shared helper to eliminate code duplication across forward methods.
+
+        Args:
+            x: Patch embeddings of shape (B, num_patches, embed_dim)
+
+        Returns:
+            x: Prepared tokens with positional encoding (B, num_tokens, embed_dim)
+            num_special_tokens: Number of special tokens (1 for cls, 2 for cls+dist)
+        """
+        B = x.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+
+        if self.distillation:
+            dist_tokens = self.dist_token.expand(B, -1, -1)
+            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
+            num_special_tokens = 2
+        else:
+            x = torch.cat([cls_tokens, x], dim=1)
+            num_special_tokens = 1
+
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        return x, num_special_tokens
+
     def forward(self, x):
         """
         Forward pass.
@@ -462,18 +491,9 @@ class DeiT(nn.Module):
         # Patch embedding: (B, C, H, W) -> (B, num_patches, embed_dim)
         x = self.patch_embed(x)
 
-        # Prepend class token (and distillation token if enabled)
+        # Prepend class/dist tokens and add positional embedding
+        x, num_special_tokens = self._prepare_tokens(x)
         B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if self.distillation:
-            dist_tokens = self.dist_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
-        else:
-            x = torch.cat([cls_tokens, x], dim=1)
-
-        # Add positional embedding
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
 
         # Transformer blocks
         for block in self.blocks:
@@ -487,7 +507,6 @@ class DeiT(nn.Module):
         if self.training and self.cls_token_dropout > 0:
             mask = torch.rand(B, device=x.device) < self.cls_token_dropout
             # Compute mean of patch tokens (skip cls and dist tokens)
-            num_special_tokens = 2 if self.distillation else 1
             patch_mean = x[:, num_special_tokens:, :].mean(dim=1)  # (B, embed_dim)
             # Replace cls token where mask is True
             x = x.clone()  # Avoid in-place modification for autograd
@@ -518,17 +537,7 @@ class DeiT(nn.Module):
             x = self.channel_expand(x)
 
         x = self.patch_embed(x)
-
-        B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if self.distillation:
-            dist_tokens = self.dist_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
-        else:
-            x = torch.cat([cls_tokens, x], dim=1)
-
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        x, _ = self._prepare_tokens(x)
 
         for block in self.blocks:
             x = block(x)
@@ -549,17 +558,7 @@ class DeiT(nn.Module):
             x = self.channel_expand(x)
 
         x = self.patch_embed(x)
-
-        B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if self.distillation:
-            dist_tokens = self.dist_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
-        else:
-            x = torch.cat([cls_tokens, x], dim=1)
-
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        x, _ = self._prepare_tokens(x)
 
         for block in self.blocks:
             x = block(x)
@@ -606,20 +605,8 @@ class DeiT(nn.Module):
         # Patch embedding
         x = self.patch_embed(x)
 
-        # Prepend tokens
-        B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if self.distillation:
-            dist_tokens = self.dist_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
-            num_special_tokens = 2
-        else:
-            x = torch.cat([cls_tokens, x], dim=1)
-            num_special_tokens = 1
-
-        # Add positional embedding
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        # Prepend tokens and add positional embedding
+        x, num_special_tokens = self._prepare_tokens(x)
 
         # Pass through transformer blocks, capturing intermediates
         for idx, block in enumerate(self.blocks):
@@ -683,18 +670,8 @@ class DeiT(nn.Module):
         # Patch embedding
         x = self.patch_embed(x)
 
-        # Prepend tokens
-        B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if self.distillation:
-            dist_tokens = self.dist_token.expand(B, -1, -1)
-            x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
-        else:
-            x = torch.cat([cls_tokens, x], dim=1)
-
-        # Add positional embedding
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+        # Prepend tokens and add positional embedding
+        x, _ = self._prepare_tokens(x)
 
         # Pass through transformer blocks with attention extraction
         for idx, block in enumerate(self.blocks):

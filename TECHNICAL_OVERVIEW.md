@@ -57,7 +57,7 @@ return x * y.expand_as(x)                  # Channel-wise scaling
 #### Residual Block with SE
 
 ```
-ResBlock(x) = ReLU(SE(BN(Conv(BN(Conv(x))))) + Shortcut(x))
+ResBlock(x) = ReLU(SE(BN(Conv(ReLU(BN(Conv(x)))))) + Shortcut(x))
 ```
 
 #### MNIST Architecture (709K parameters)
@@ -168,7 +168,7 @@ Drop rates increase linearly with depth: `drop_path[i] = i/(L-1) × max_rate`
 | Embedding dim | 192 |
 | Depth | 12 blocks |
 | Heads | 3 |
-| MLP ratio | 2.0 |
+| MLP ratio | 2.0 (code default: 4.0) |
 | Patch size | 4 |
 | Drop path rate | 0.1 |
 | Parameters | ~4M |
@@ -357,7 +357,7 @@ w_SWA = (1/n) Σᵢ wᵢ
 
 Activates at epoch `⌊0.75 × num_epochs⌋`, uses reduced LR (default: 0.0005).
 
-**Post-Training**: Updates BatchNorm statistics on full training set.
+**Post-Training**: Updates BatchNorm statistics on full training set via `torch.optim.swa_utils.update_bn()`. See `src/training.py:600` and `src/distillation.py:554,1946`.
 
 ### 4.5 Gradient Clipping
 
@@ -448,6 +448,8 @@ transforms.RandAugment(num_ops=2, magnitude=9)
 η(t) = η_max × (t+1) / warmup_epochs
 ```
 
+**Implementation**: Warmup is applied at the training loop level via `GradualWarmupScheduler` or manual LR adjustment in epoch callbacks. See `src/training.py` scheduler integration and distillation trainer epoch loops.
+
 ### 6.3 Gradient Accumulation
 
 Simulates larger batch sizes:
@@ -496,15 +498,17 @@ if (batch_idx + 1) % grad_accum_steps == 0:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.py` | 1094 | CLI entry point, training orchestration |
-| `src/config.py` | 393 | Configuration classes, YAML loading |
-| `src/models.py` | 231 | AdaptiveCNN, SEBlock, ResidualBlock, ModelFactory |
-| `src/vit.py` | 663 | DeiT, PatchEmbed, MHSA, TransformerBlock |
-| `src/training.py` | 534 | Trainer, DDPTrainer, EarlyStopping |
-| `src/distillation.py` | 1342 | DistillationTrainer, SelfSupervisedDistillationTrainer |
-| `src/datasets.py` | 386 | DatasetManager, Cutout, MixUp, CutMix |
+| `main.py` | 977 | CLI entry point, unified DDP training orchestration |
+| `src/config.py` | 439 | Configuration classes, YAML loading |
+| `src/models.py` | 253 | AdaptiveCNN, SEBlock, ResidualBlock, ModelFactory |
+| `src/vit.py` | 715 | DeiT, PatchEmbed, MHSA, TransformerBlock |
+| `src/training.py` | 605 | Trainer, DDPTrainer, EarlyStopping; utilities: `build_optimizer`, `build_scheduler`, `build_checkpoint_dict` |
+| `src/distillation.py` | 1951 | DistillationTrainer, SelfSupervisedDistillationTrainer, CKALoss, GramMatrixLoss |
+| `src/datasets.py` | 585 | DatasetManager, Cutout, MixingDataset (unified MixUp/CutMix) |
 | `src/evaluation.py` | 326 | ModelEvaluator, TestTimeAugmentation |
-| `src/visualization.py` | 305 | GradCAM, FeatureMapVisualizer |
+| `src/visualization.py` | 305 | GradCAM, FeatureMapVisualizer, TrainingVisualizer |
+| `src/analytics.py` | 1099 | HessianAnalyzer, CKAAnalyzer, AttentionDistanceAnalyzer, AnalyticsVisualizer |
+| `src/teachers.py` | 309 | ResNet18CIFAR, ConvNeXtV2Tiny teacher models |
 
 ---
 

@@ -1,8 +1,19 @@
+"""
+Unified CLI entry point for dataset-adaptive image classification.
+
+Supports:
+- Standard training (AdaptiveCNN, ViT)
+- Knowledge distillation (CNN → DeiT)
+- Self-supervised distillation (DINOv2 → DeiT)
+- Evaluation and analytics
+"""
 import argparse
 import logging
 import os
 import random
+import socket
 from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple, Any
 
 import numpy as np
 import torch
@@ -31,13 +42,17 @@ from src.datasets import DatasetManager, preprocess_image
 from src.evaluation import ModelEvaluator, TestTimeAugmentation
 from src.training import DDPTrainer
 from src.distillation import DistillationTrainer, SelfSupervisedDistillationTrainer, load_dino_teacher
-from src.visualization import FeatureMapVisualizer, GradCAM, TrainingVisualizer, AnalyticsVisualizer
-from src.analytics import AnalyticsRunner
+from src.visualization import FeatureMapVisualizer, GradCAM, TrainingVisualizer
+from src.analytics import AnalyticsRunner, AnalyticsVisualizer
 
 logger = logging.getLogger(__name__)
 
 
-def set_seed(seed):
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def set_seed(seed: int) -> None:
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
@@ -47,14 +62,17 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = False
 
 
-def train_worker(
-    rank: int,
-    world_size: int,
-    config_path: str
-):
-    """DDP training worker for a single GPU process."""
+def find_free_port() -> int:
+    """Find a free port for DDP communication."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+def setup_ddp_environment(rank: int, world_size: int, port: Optional[int] = None) -> None:
+    """Set up DDP environment variables and initialize process group."""
     os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
-    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', str(port or 29500))
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
@@ -66,209 +84,270 @@ def train_worker(
         rank=rank
     )
 
+
+def setup_directories(config: Config, world_size: int, is_main_process: bool) -> Tuple[Path, Path]:
+    """Create output and checkpoint directories."""
+    if world_size > 1:
+        config.experiment_name = f"{config.experiment_name}_ddp_{world_size}gpu"
+
+    output_dir = Path(config.output_dir) / config.experiment_name
+    checkpoints_dir = output_dir / "checkpoints"
+
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    dist.barrier()
+    return output_dir, checkpoints_dir
+
+
+def setup_logging_for_rank(config: Config, rank: int, world_size: int, mode_name: str) -> logging.Logger:
+    """Set up logging based on process rank."""
+    is_main_process = (rank == 0)
+
+    if is_main_process:
+        setup_logging(config.logging)
+        log = logging.getLogger(__name__)
+        log.info("=" * 60)
+        log.info(f"{mode_name} (DDP)")
+        log.info("=" * 60)
+        log.info(f"Experiment: {config.experiment_name}")
+        log.info(f"Dataset: {config.data.dataset}")
+        log.info(f"World Size: {world_size}")
+        log.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
+        log.info("=" * 60)
+    else:
+        logging.basicConfig(level=logging.ERROR)
+        log = logging.getLogger(__name__)
+
+    return log
+
+
+def build_model_config(config: Config) -> dict:
+    """Build merged model configuration (model + vit configs)."""
+    model_config = config.model.__dict__.copy()
+    if hasattr(config, 'vit') and config.vit is not None:
+        vit_dict = config.vit.__dict__ if hasattr(config.vit, '__dict__') else config.vit
+        model_config.update(vit_dict)
+    return model_config
+
+
+def create_distributed_dataloaders(
+    config: Config,
+    world_size: int,
+    rank: int,
+    use_dual_augment: bool = False
+) -> Tuple[DataLoader, DistributedSampler, DataLoader, DataLoader]:
+    """Create train/val/test dataloaders with distributed samplers."""
+    # Get datasets
+    if use_dual_augment:
+        train_dataset = DatasetManager.get_dual_augment_dataset(config)
+    else:
+        train_dataset = DatasetManager.get_dataset(config, is_train=True)
+
+    val_dataset = DatasetManager.get_dataset(config, is_train=False)
+    test_dataset = DatasetManager.get_dataset(config, is_train=False)
+
+    # Create samplers
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=config.seed,
+        drop_last=True
+    )
+
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+
+    # DataLoader kwargs
+    loader_kwargs = {
+        'batch_size': config.data.batch_size,
+        'num_workers': config.data.num_workers,
+        'pin_memory': config.data.pin_memory,
+        'persistent_workers': config.data.persistent_workers and config.data.num_workers > 0,
+        'prefetch_factor': config.data.prefetch_factor if config.data.num_workers > 0 else 2
+    }
+
+    train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=config.data.pin_memory
+    )
+
+    return train_loader, train_sampler, val_loader, test_loader
+
+
+def evaluate_and_save_results(
+    trainer,
+    test_loader: DataLoader,
+    dataset_info: dict,
+    config: Config,
+    output_dir: Path,
+    metrics_history: dict,
+    world_size: int,
+    mode_name: str,
+    extra_metrics_info: Optional[Dict[str, Any]] = None
+) -> dict:
+    """Evaluate model and save results (only on main process)."""
+    log = logging.getLogger(__name__)
+
+    log.info("=" * 60)
+    log.info("EVALUATING ON TEST SET")
+    log.info("=" * 60)
+
+    # Get unwrapped model for evaluation
+    model = trainer.ddp_model.module if hasattr(trainer.ddp_model, 'module') else trainer.ddp_model
+    device = trainer.device
+
+    evaluator = ModelEvaluator(model, device, dataset_info.get('classes'))
+    test_metrics = evaluator.evaluate(test_loader)
+    evaluator.print_summary()
+
+    # Save config
+    ConfigManager.save_config(config, output_dir / 'config.yaml')
+
+    # Save training history
+    if metrics_history:
+        TrainingVisualizer.plot_training_history(
+            metrics_history,
+            save_path=output_dir / 'training_history.png'
+        )
+
+    # Save confusion matrix
+    evaluator.plot_confusion_matrix(
+        save_path=output_dir / 'confusion_matrix.png',
+        normalize=True
+    )
+
+    # Save metrics file
+    metrics_file = output_dir / 'test_metrics.txt'
+    with open(metrics_file, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write(f"{mode_name} RESULTS\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Configuration: {world_size} GPUs with DDP\n")
+        f.write(f"Effective Batch Size: {config.data.batch_size * world_size}\n")
+
+        # Write extra info if provided
+        if extra_metrics_info:
+            f.write("\n")
+            for key, value in extra_metrics_info.items():
+                f.write(f"{key}: {value}\n")
+
+        f.write(f"\nAccuracy:          {test_metrics['accuracy']:.4f}\n")
+        f.write(f"Precision (macro): {test_metrics['precision_macro']:.4f}\n")
+        f.write(f"Recall (macro):    {test_metrics['recall_macro']:.4f}\n")
+        f.write(f"F1 Score (macro):  {test_metrics['f1_macro']:.4f}\n")
+        f.write(f"Loss:              {test_metrics.get('loss', 'N/A')}\n")
+
+        if 'auc_macro' in test_metrics:
+            f.write(f"\nAUC Macro: {test_metrics['auc_macro']:.4f}\n")
+            f.write(f"AUC Weighted: {test_metrics['auc_weighted']:.4f}\n")
+
+    log.info("=" * 60)
+    log.info(f"{mode_name} COMPLETED")
+    log.info(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
+    log.info(f"Outputs saved to: {output_dir}")
+    log.info("=" * 60)
+
+    return {
+        'experiment_name': config.experiment_name,
+        'test_accuracy': test_metrics['accuracy'],
+        'output_dir': str(output_dir),
+        'num_gpus': world_size
+    }
+
+
+def add_safe_globals_for_checkpoints():
+    """Add safe globals for torch.load with weights_only=False."""
+    if hasattr(torch.serialization, 'add_safe_globals'):
+        torch.serialization.add_safe_globals([
+            Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
+            ViTConfig, DistillationConfig, SelfSupervisedDistillationConfig
+        ])
+
+
+# =============================================================================
+# Unified DDP Worker
+# =============================================================================
+
+def unified_ddp_worker(
+    rank: int,
+    world_size: int,
+    config_path: str,
+    mode: str,
+    port: int
+) -> Optional[dict]:
+    """
+    Unified DDP training worker that handles all training modes.
+
+    Args:
+        rank: Process rank
+        world_size: Total number of processes
+        config_path: Path to configuration file
+        mode: Training mode ('standard', 'distill', 'ss_distill')
+        port: Port for DDP communication
+    """
+    setup_ddp_environment(rank, world_size, port)
+
     result = None
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         is_main_process = (rank == 0)
 
+        # Load config
         config = ConfigManager.load_config(config_path)
 
-        if world_size > 1:
-            config.experiment_name = f"{config.experiment_name}_ddp_{world_size}gpu"
+        # Mode-specific names
+        mode_names = {
+            'standard': 'PyTorch DDP Training',
+            'distill': 'DeiT Distillation Training',
+            'ss_distill': 'Self-Supervised Token Distillation (CST-Style) Training'
+        }
+        mode_name = mode_names[mode]
 
-        output_dir = Path(config.output_dir) / config.experiment_name
-        checkpoints_dir = output_dir / "checkpoints"
-
-        if is_main_process:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-        dist.barrier()
-
-        if is_main_process:
-            setup_logging(config.logging)
-            logger = logging.getLogger(__name__)
-            logger.info("=" * 60)
-            logger.info("PyTorch Distributed Data Parallel (DDP) Training")
-            logger.info("=" * 60)
-            logger.info(f"Experiment: {config.experiment_name}")
-            logger.info(f"Dataset: {config.data.dataset}")
-            logger.info(f"World Size: {world_size}")
-            logger.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
-            logger.info("Backend: NCCL")
-            logger.info("=" * 60)
-        else:
-            logging.basicConfig(level=logging.ERROR)
-            logger = logging.getLogger(__name__)
+        # Setup directories and logging
+        output_dir, checkpoints_dir = setup_directories(config, world_size, is_main_process)
+        log = setup_logging_for_rank(config, rank, world_size, mode_name)
 
         set_seed(config.seed + rank)
 
-        if is_main_process:
-            logger.info(f"Process {rank}: Using device cuda:{rank}")
-            logger.info(f"GPU Name: {torch.cuda.get_device_name(rank)}")
-            logger.info(f"Total GPUs Available: {torch.cuda.device_count()}")
-
+        # Get dataset info
         dataset_info = DatasetManager.get_dataset_info(config)
         config.model.in_channels = dataset_info['in_channels']
         config.model.num_classes = dataset_info['num_classes']
         config.model.dataset = config.data.dataset
 
-        # Build model config (merge vit config for DeiT models)
-        model_config = config.model.__dict__.copy()
-        if config.model.model_type == 'deit' and hasattr(config, 'vit') and config.vit is not None:
-            model_config.update(config.vit.__dict__ if hasattr(config.vit, '__dict__') else config.vit)
+        # Build model config
+        model_config = build_model_config(config)
 
-        model = ModelFactory.create_model(config.model.model_type, model_config)
-        model = model.to(device)
-
-        model = DDP(
-            model,
-            device_ids=[rank],
-            output_device=rank,
-            find_unused_parameters=False
-        )
-
-        if is_main_process:
-            total_params = sum(p.numel() for p in model.module.parameters())
-            trainable_params = sum(p.numel() for p in model.module.parameters() if p.requires_grad)
-            logger.info("Model wrapped with DistributedDataParallel")
-            logger.info(f"Total parameters: {total_params:,}")
-            logger.info(f"Trainable parameters: {trainable_params:,}")
-            logger.info(f"Effective batch size: {config.data.batch_size * world_size}")
-
-        if is_main_process:
-            logger.info("Creating distributed data loaders...")
-
-        train_dataset = DatasetManager.get_dataset(config, is_train=True)
-        val_dataset = DatasetManager.get_dataset(config, is_train=False)
-        test_dataset = DatasetManager.get_dataset(config, is_train=False)
-
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=config.seed,
-            drop_last=True
-        )
-
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            sampler=train_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.data.batch_size,
-            sampler=val_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory
-        )
-
-        if is_main_process:
-            logger.info(f"Train samples: {len(train_dataset)} ({len(train_dataset)//world_size} per GPU)")
-            logger.info(f"Val samples: {len(val_dataset)} ({len(val_dataset)//world_size} per GPU)")
-            logger.info(f"Test samples: {len(test_dataset)}")
-
-        ddp_trainer = DDPTrainer(model, config, device, rank, world_size)
-
-        checkpoint_path = checkpoints_dir / f"best_model_{config.data.dataset}_ddp.pth"
-
-        if is_main_process:
-            if checkpoint_path.exists():
-                logger.info(f"Found checkpoint: {checkpoint_path}")
-                try:
-                    ddp_trainer.load_checkpoint(checkpoint_path)
-                    logger.info(f"Resumed from epoch {ddp_trainer.current_epoch}")
-                except Exception as e:
-                    logger.warning(f"Failed to load checkpoint: {e}")
-            else:
-                logger.info("No checkpoint found. Starting fresh training.")
-
-        dist.barrier()
-
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("STARTING DDP TRAINING")
-            logger.info("=" * 60)
-
-        metrics_history = ddp_trainer.train_ddp(train_loader, train_sampler, val_loader)
-
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("EVALUATING ON TEST SET")
-            logger.info("=" * 60)
-
-            evaluator = ModelEvaluator(ddp_trainer.model, device, dataset_info.get('classes'))
-            test_metrics = evaluator.evaluate(test_loader)
-            evaluator.print_summary()
-
-            ConfigManager.save_config(config, output_dir / 'config.yaml')
-
-            if metrics_history:
-                TrainingVisualizer.plot_training_history(
-                    metrics_history,
-                    save_path=output_dir / 'training_history.png'
-                )
-
-            evaluator.plot_confusion_matrix(
-                save_path=output_dir / 'confusion_matrix.png',
-                normalize=True
+        # Mode-specific setup
+        if mode == 'standard':
+            result = _run_standard_training(
+                rank, world_size, device, config, model_config, dataset_info,
+                output_dir, checkpoints_dir, is_main_process, log, mode_name
             )
-
-            metrics_file = output_dir / 'test_metrics.txt'
-            with open(metrics_file, 'w') as f:
-                f.write("=" * 60 + "\n")
-                f.write("FINAL TEST METRICS (DDP Training)\n")
-                f.write("=" * 60 + "\n\n")
-                f.write(f"Configuration: {world_size} GPUs with DDP\n")
-                f.write(f"Effective Batch Size: {config.data.batch_size * world_size}\n\n")
-                f.write(f"Accuracy:          {test_metrics['accuracy']:.4f}\n")
-                f.write(f"Precision (macro): {test_metrics['precision_macro']:.4f}\n")
-                f.write(f"Recall (macro):    {test_metrics['recall_macro']:.4f}\n")
-                f.write(f"F1 Score (macro):  {test_metrics['f1_macro']:.4f}\n")
-                f.write(f"Loss:              {test_metrics.get('loss', 'N/A')}\n")
-
-                if 'auc_macro' in test_metrics:
-                    f.write(f"\nAUC Macro: {test_metrics['auc_macro']:.4f}\n")
-                    f.write(f"AUC Weighted: {test_metrics['auc_weighted']:.4f}\n")
-
-            logger.info("=" * 60)
-            logger.info("DDP TRAINING COMPLETED SUCCESSFULLY")
-            logger.info(f"Experiment: {config.experiment_name}")
-            logger.info(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
-            logger.info(f"Outputs saved to: {output_dir}")
-            logger.info("=" * 60)
-
-            result = {
-                'experiment_name': config.experiment_name,
-                'test_accuracy': test_metrics['accuracy'],
-                'output_dir': str(output_dir),
-                'num_gpus': world_size
-            }
+        elif mode == 'distill':
+            result = _run_distillation_training(
+                rank, world_size, device, config, model_config, dataset_info,
+                output_dir, checkpoints_dir, is_main_process, log, mode_name
+            )
+        elif mode == 'ss_distill':
+            result = _run_ss_distillation_training(
+                rank, world_size, device, config, model_config, dataset_info,
+                output_dir, checkpoints_dir, is_main_process, log, mode_name
+            )
 
     finally:
         dist.destroy_process_group()
@@ -276,8 +355,236 @@ def train_worker(
     return result
 
 
-def train_locally(config_path: str, num_gpus: int = 1):
-    """Train on local GPUs using DDP for multi-GPU."""
+def _run_standard_training(
+    rank, world_size, device, config, model_config, dataset_info,
+    output_dir, checkpoints_dir, is_main_process, log, mode_name
+):
+    """Run standard DDP training."""
+    # Create model
+    model = ModelFactory.create_model(config.model.model_type, model_config)
+    model = model.to(device)
+
+    # Wrap with DDP
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
+
+    if is_main_process:
+        total_params = sum(p.numel() for p in model.module.parameters())
+        trainable_params = sum(p.numel() for p in model.module.parameters() if p.requires_grad)
+        log.info(f"Total parameters: {total_params:,}")
+        log.info(f"Trainable parameters: {trainable_params:,}")
+        log.info(f"Effective batch size: {config.data.batch_size * world_size}")
+
+    # Create dataloaders
+    train_loader, train_sampler, val_loader, test_loader = create_distributed_dataloaders(
+        config, world_size, rank
+    )
+
+    if is_main_process:
+        log.info(f"Train samples: {len(train_loader.dataset)} ({len(train_loader.dataset)//world_size} per GPU)")
+
+    # Create trainer
+    trainer = DDPTrainer(model, config, device, rank, world_size)
+
+    # Check for existing checkpoint
+    checkpoint_path = checkpoints_dir / f"best_model_{config.data.dataset}_ddp.pth"
+    if is_main_process and checkpoint_path.exists():
+        try:
+            trainer.load_checkpoint(checkpoint_path)
+            log.info(f"Resumed from epoch {trainer.current_epoch}")
+        except Exception as e:
+            log.warning(f"Failed to load checkpoint: {e}")
+
+    dist.barrier()
+
+    # Train
+    if is_main_process:
+        log.info("=" * 60)
+        log.info("STARTING DDP TRAINING")
+        log.info("=" * 60)
+
+    metrics_history = trainer.train_ddp(train_loader, train_sampler, val_loader)
+
+    # Evaluate (main process only)
+    if is_main_process:
+        return evaluate_and_save_results(
+            trainer, test_loader, dataset_info, config, output_dir,
+            metrics_history, world_size, mode_name
+        )
+    return None
+
+
+def _run_distillation_training(
+    rank, world_size, device, config, model_config, dataset_info,
+    output_dir, checkpoints_dir, is_main_process, log, mode_name
+):
+    """Run CNN→DeiT distillation training."""
+    # Create student model (DeiT)
+    student_model = ModelFactory.create_model('deit', model_config)
+    student_model = student_model.to(device)
+
+    if is_main_process:
+        total_params = sum(p.numel() for p in student_model.parameters())
+        log.info(f"Student model (DeiT) created with {total_params:,} parameters")
+
+    # Load teacher model
+    teacher_checkpoint_path = Path(config.distillation.teacher_checkpoint)
+    if not teacher_checkpoint_path.exists():
+        raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_checkpoint_path}")
+
+    teacher_config = config.model.__dict__.copy()
+    teacher_model = ModelFactory.create_model(config.distillation.teacher_model_type, teacher_config)
+    teacher_model = teacher_model.to(device)
+
+    add_safe_globals_for_checkpoints()
+    teacher_checkpoint = torch.load(teacher_checkpoint_path, map_location=device)
+    if 'model_state_dict' not in teacher_checkpoint:
+        raise KeyError(f"Teacher checkpoint missing 'model_state_dict'. Keys: {list(teacher_checkpoint.keys())}")
+    teacher_model.load_state_dict(teacher_checkpoint['model_state_dict'])
+    teacher_model.eval()
+
+    if is_main_process:
+        teacher_acc = teacher_checkpoint.get('best_val_acc', 'N/A')
+        log.info(f"Teacher model loaded from: {teacher_checkpoint_path}")
+        log.info(f"Teacher validation accuracy: {teacher_acc}")
+
+    # Wrap student with DDP
+    student_model = DDP(student_model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+
+    # Create dataloaders
+    train_loader, train_sampler, val_loader, test_loader = create_distributed_dataloaders(
+        config, world_size, rank
+    )
+
+    if is_main_process:
+        log.info(f"Train samples: {len(train_loader.dataset)} ({len(train_loader.dataset)//world_size} per GPU)")
+        log.info(f"Effective batch size: {config.data.batch_size * world_size}")
+
+    # Create distillation trainer
+    trainer = DistillationTrainer(student_model, teacher_model, config, device, rank, world_size)
+
+    dist.barrier()
+
+    if is_main_process:
+        log.info("=" * 60)
+        log.info("STARTING DISTILLATION TRAINING")
+        log.info("=" * 60)
+
+    # Train
+    metrics_history = trainer.train_ddp(train_loader, train_sampler, val_loader)
+
+    # Evaluate (main process only)
+    if is_main_process:
+        extra_info = {
+            'Teacher': config.distillation.teacher_model_type,
+            'Distillation Type': config.distillation.distillation_type,
+            'Alpha': config.distillation.alpha
+        }
+        return evaluate_and_save_results(
+            trainer, test_loader, dataset_info, config, output_dir,
+            metrics_history, world_size, mode_name, extra_info
+        )
+    return None
+
+
+def _run_ss_distillation_training(
+    rank, world_size, device, config, model_config, dataset_info,
+    output_dir, checkpoints_dir, is_main_process, log, mode_name
+):
+    """Run DINOv2→DeiT self-supervised distillation training."""
+    # Validate config
+    if config.ss_distillation is None:
+        raise ValueError("ss_distillation config is required for train-ss-distill command")
+
+    # Create student model (DeiT)
+    student_model = ModelFactory.create_model('deit', model_config)
+    student_model = student_model.to(device)
+
+    if is_main_process:
+        total_params = sum(p.numel() for p in student_model.parameters())
+        log.info(f"Student model (DeiT) created with {total_params:,} parameters")
+        log.info(f"Loading {config.ss_distillation.teacher_type} teacher: {config.ss_distillation.teacher_model_name}")
+
+    # Load DINO/DINOv2 teacher
+    teacher_model, teacher_embed_dim = load_dino_teacher(
+        config.ss_distillation.teacher_type,
+        config.ss_distillation.teacher_model_name,
+        device
+    )
+
+    if is_main_process:
+        teacher_params = sum(p.numel() for p in teacher_model.parameters())
+        log.info(f"Teacher model loaded with {teacher_params:,} parameters (frozen)")
+        log.info(f"Teacher embedding dim: {teacher_embed_dim}")
+
+    # Wrap student with DDP
+    student_model = DDP(student_model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+
+    # Create dataloaders (with dual-augment if enabled)
+    use_dual_augment = getattr(config.ss_distillation, 'use_dual_augment', False)
+    if is_main_process and use_dual_augment:
+        log.info("Using dual-path augmentation (clean for teacher, augmented for student)")
+
+    train_loader, train_sampler, val_loader, test_loader = create_distributed_dataloaders(
+        config, world_size, rank, use_dual_augment=use_dual_augment
+    )
+
+    if is_main_process:
+        log.info(f"Train samples: {len(train_loader.dataset)} ({len(train_loader.dataset)//world_size} per GPU)")
+        log.info(f"Effective batch size: {config.data.batch_size * world_size}")
+        log.info(f"Token layers for distillation: {config.ss_distillation.token_layers}")
+        log.info(f"Lambda tok: {config.ss_distillation.lambda_tok}, Lambda rel: {config.ss_distillation.lambda_rel}")
+        log.info(f"L_rel warmup epochs: {config.ss_distillation.rel_warmup_epochs}")
+
+    # Create trainer
+    trainer = SelfSupervisedDistillationTrainer(
+        student_model=student_model,
+        teacher_model=teacher_model,
+        teacher_embed_dim=teacher_embed_dim,
+        config=config,
+        device=device,
+        rank=rank,
+        world_size=world_size
+    )
+
+    dist.barrier()
+
+    if is_main_process:
+        log.info("=" * 60)
+        log.info("STARTING SELF-SUPERVISED DISTILLATION TRAINING")
+        log.info("=" * 60)
+
+    # Train
+    metrics_history = trainer.train_ddp(train_loader, train_sampler, val_loader)
+
+    # Evaluate (main process only)
+    if is_main_process:
+        extra_info = {
+            'Teacher': f"{config.ss_distillation.teacher_type} ({config.ss_distillation.teacher_model_name})",
+            'Token Layers': str(config.ss_distillation.token_layers),
+            'Lambda Tok': config.ss_distillation.lambda_tok,
+            'Lambda Rel': config.ss_distillation.lambda_rel,
+            'L_rel Warmup': f"{config.ss_distillation.rel_warmup_epochs} epochs"
+        }
+        return evaluate_and_save_results(
+            trainer, test_loader, dataset_info, config, output_dir,
+            metrics_history, world_size, mode_name, extra_info
+        )
+    return None
+
+
+# =============================================================================
+# Unified Local Training Entry Point
+# =============================================================================
+
+def train_locally(config_path: str, num_gpus: int = 1, mode: str = 'standard') -> int:
+    """
+    Train on local GPUs using DDP for multi-GPU.
+
+    Args:
+        config_path: Path to configuration file
+        num_gpus: Number of GPUs to use
+        mode: Training mode ('standard', 'distill', 'ss_distill')
+    """
     config_file = Path(config_path)
     if not config_file.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -290,18 +597,33 @@ def train_locally(config_path: str, num_gpus: int = 1):
         print(f"Requested {num_gpus} GPUs, but only {available_gpus} available. Using {available_gpus}.")
         num_gpus = available_gpus
 
+    mode_names = {
+        'standard': 'PyTorch DDP Training',
+        'distill': 'DeiT Distillation Training',
+        'ss_distill': 'Self-Supervised Token Distillation (CST-Style) Training'
+    }
+
+    # Find free port for this training run
+    port = find_free_port()
+
     print(f"\n{'='*60}")
-    print("PyTorch Distributed Data Parallel (DDP) Training")
+    print(mode_names[mode])
     print(f"{'='*60}")
     print(f"Config: {config_path}")
     print(f"GPUs: {num_gpus} x {torch.cuda.get_device_name(0)}")
     print(f"Mode: {'DDP Multi-GPU' if num_gpus > 1 else 'Single GPU'}")
+    print(f"Port: {port}")
     print(f"{'='*60}\n")
 
     if num_gpus == 1:
-        result = train_worker(0, 1, config_path)
+        result = unified_ddp_worker(0, 1, config_path, mode, port)
     else:
-        mp.spawn(train_worker, args=(num_gpus, config_path), nprocs=num_gpus, join=True)
+        mp.spawn(
+            unified_ddp_worker,
+            args=(num_gpus, config_path, mode, port),
+            nprocs=num_gpus,
+            join=True
+        )
         result = {"status": "completed", "num_gpus": num_gpus}
 
     if result and isinstance(result, dict):
@@ -314,592 +636,17 @@ def train_locally(config_path: str, num_gpus: int = 1):
             print(f"GPUs Used: {result['num_gpus']}")
             print(f"Output Directory: {result['output_dir']}")
         else:
-            print(f"DDP Training completed with {result.get('num_gpus', num_gpus)} GPUs")
+            print(f"Training completed with {result.get('num_gpus', num_gpus)} GPUs")
         print(f"{'='*60}\n")
 
     return 0
 
 
-def train_distill_worker(
-    rank: int,
-    world_size: int,
-    config_path: str
-):
-    """DDP training worker for DeiT distillation training."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29501')  # Use env or default
-    os.environ['RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['LOCAL_RANK'] = str(rank)
-
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=world_size,
-        rank=rank
-    )
-
-    result = None
-    try:
-        torch.cuda.set_device(rank)
-        device = torch.device(f"cuda:{rank}")
-        is_main_process = (rank == 0)
-
-        config = ConfigManager.load_config(config_path)
-
-        if world_size > 1:
-            config.experiment_name = f"{config.experiment_name}_ddp_{world_size}gpu"
-
-        output_dir = Path(config.output_dir) / config.experiment_name
-        checkpoints_dir = output_dir / "checkpoints"
-
-        if is_main_process:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-        dist.barrier()
-
-        if is_main_process:
-            setup_logging(config.logging)
-            logger = logging.getLogger(__name__)
-            logger.info("=" * 60)
-            logger.info("DeiT Distillation Training (DDP)")
-            logger.info("=" * 60)
-            logger.info(f"Experiment: {config.experiment_name}")
-            logger.info(f"Dataset: {config.data.dataset}")
-            logger.info(f"World Size: {world_size}")
-            logger.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
-            logger.info("=" * 60)
-        else:
-            logging.basicConfig(level=logging.ERROR)
-            logger = logging.getLogger(__name__)
-
-        set_seed(config.seed + rank)
-
-        # Get dataset info
-        dataset_info = DatasetManager.get_dataset_info(config)
-        config.model.in_channels = dataset_info['in_channels']
-        config.model.num_classes = dataset_info['num_classes']
-        config.model.dataset = config.data.dataset
-
-        # Build student model config (merge model and vit configs)
-        student_config = config.model.__dict__.copy()
-        if config.vit is not None:
-            student_config.update(config.vit.__dict__)
-
-        # Create student model (DeiT)
-        student_model = ModelFactory.create_model('deit', student_config)
-        student_model = student_model.to(device)
-
-        if is_main_process:
-            total_params = sum(p.numel() for p in student_model.parameters())
-            logger.info(f"Student model (DeiT) created with {total_params:,} parameters")
-
-        # Load teacher model
-        teacher_checkpoint_path = Path(config.distillation.teacher_checkpoint)
-        if not teacher_checkpoint_path.exists():
-            raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_checkpoint_path}")
-
-        # Create teacher model (AdaptiveCNN)
-        teacher_config = config.model.__dict__.copy()
-        teacher_model = ModelFactory.create_model(
-            config.distillation.teacher_model_type,
-            teacher_config
-        )
-        teacher_model = teacher_model.to(device)
-
-        # Load teacher weights
-        if hasattr(torch.serialization, 'add_safe_globals'):
-            torch.serialization.add_safe_globals([
-                Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
-                ViTConfig, DistillationConfig
-            ])
-        teacher_checkpoint = torch.load(teacher_checkpoint_path, map_location=device)
-        if 'model_state_dict' not in teacher_checkpoint:
-            raise KeyError(
-                f"Teacher checkpoint at {teacher_checkpoint_path} is missing 'model_state_dict' key. "
-                f"Available keys: {list(teacher_checkpoint.keys())}"
-            )
-        teacher_model.load_state_dict(teacher_checkpoint['model_state_dict'])
-        teacher_model.eval()
-
-        if is_main_process:
-            teacher_acc = teacher_checkpoint.get('best_val_acc', 'N/A')
-            logger.info(f"Teacher model loaded from: {teacher_checkpoint_path}")
-            logger.info(f"Teacher validation accuracy: {teacher_acc}")
-            if isinstance(teacher_acc, (int, float)) and teacher_acc > 99.7:
-                logger.warning("Teacher accuracy > 99.7%. Consider using lower alpha to prevent dominance.")
-
-        # Wrap student with DDP
-        # DeiT has a distillation token that may not be used in all loss calculations
-        student_model = DDP(
-            student_model,
-            device_ids=[rank],
-            output_device=rank,
-            find_unused_parameters=True  # Required for DeiT distillation token
-        )
-
-        # Create data loaders
-        train_dataset = DatasetManager.get_dataset(config, is_train=True)
-        val_dataset = DatasetManager.get_dataset(config, is_train=False)
-        test_dataset = DatasetManager.get_dataset(config, is_train=False)
-
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=config.seed,
-            drop_last=True
-        )
-
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            sampler=train_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.data.batch_size,
-            sampler=val_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory
-        )
-
-        if is_main_process:
-            logger.info(f"Train samples: {len(train_dataset)} ({len(train_dataset)//world_size} per GPU)")
-            logger.info(f"Effective batch size: {config.data.batch_size * world_size}")
-
-        # Create distillation trainer
-        distill_trainer = DistillationTrainer(
-            student_model, teacher_model, config, device, rank, world_size
-        )
-
-        dist.barrier()
-
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("STARTING DISTILLATION TRAINING")
-            logger.info("=" * 60)
-
-        # Train
-        metrics_history = distill_trainer.train_ddp(train_loader, train_sampler, val_loader)
-
-        # Evaluate on test set
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("EVALUATING ON TEST SET")
-            logger.info("=" * 60)
-
-            # Use unwrapped model for evaluation (consistent with regular training)
-            eval_model = distill_trainer.ddp_model.module if hasattr(distill_trainer.ddp_model, 'module') else distill_trainer.ddp_model
-            evaluator = ModelEvaluator(eval_model, device, dataset_info.get('classes'))
-            test_metrics = evaluator.evaluate(test_loader)
-            evaluator.print_summary()
-
-            # Save config and visualizations
-            ConfigManager.save_config(config, output_dir / 'config.yaml')
-
-            if metrics_history:
-                TrainingVisualizer.plot_training_history(
-                    metrics_history,
-                    save_path=output_dir / 'training_history.png'
-                )
-
-            evaluator.plot_confusion_matrix(
-                save_path=output_dir / 'confusion_matrix.png',
-                normalize=True
-            )
-
-            # Save metrics
-            metrics_file = output_dir / 'test_metrics.txt'
-            with open(metrics_file, 'w') as f:
-                f.write("=" * 60 + "\n")
-                f.write("DEIT DISTILLATION TRAINING RESULTS\n")
-                f.write("=" * 60 + "\n\n")
-                f.write(f"Configuration: {world_size} GPUs with DDP\n")
-                f.write(f"Teacher: {config.distillation.teacher_model_type}\n")
-                f.write(f"Distillation Type: {config.distillation.distillation_type}\n")
-                f.write(f"Alpha: {config.distillation.alpha}\n\n")
-                f.write(f"Accuracy:          {test_metrics['accuracy']:.4f}\n")
-                f.write(f"Precision (macro): {test_metrics['precision_macro']:.4f}\n")
-                f.write(f"Recall (macro):    {test_metrics['recall_macro']:.4f}\n")
-                f.write(f"F1 Score (macro):  {test_metrics['f1_macro']:.4f}\n")
-
-            logger.info("=" * 60)
-            logger.info("DISTILLATION TRAINING COMPLETED")
-            logger.info(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
-            logger.info(f"Outputs saved to: {output_dir}")
-            logger.info("=" * 60)
-
-            result = {
-                'experiment_name': config.experiment_name,
-                'test_accuracy': test_metrics['accuracy'],
-                'output_dir': str(output_dir),
-                'num_gpus': world_size
-            }
-
-    finally:
-        dist.destroy_process_group()
-
-    return result
-
-
-def train_distillation_locally(config_path: str, num_gpus: int = 1):
-    """Train DeiT with distillation on local GPUs using DDP."""
-    config_file = Path(config_path)
-    if not config_file.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    available_gpus = torch.cuda.device_count()
-    if available_gpus == 0:
-        raise RuntimeError("No CUDA GPUs available.")
-
-    if num_gpus > available_gpus:
-        print(f"Requested {num_gpus} GPUs, but only {available_gpus} available. Using {available_gpus}.")
-        num_gpus = available_gpus
-
-    print(f"\n{'='*60}")
-    print("DeiT Distillation Training (DDP)")
-    print(f"{'='*60}")
-    print(f"Config: {config_path}")
-    print(f"GPUs: {num_gpus} x {torch.cuda.get_device_name(0)}")
-    print(f"{'='*60}\n")
-
-    if num_gpus == 1:
-        result = train_distill_worker(0, 1, config_path)
-    else:
-        mp.spawn(train_distill_worker, args=(num_gpus, config_path), nprocs=num_gpus, join=True)
-        result = {"status": "completed", "num_gpus": num_gpus}
-
-    if result and isinstance(result, dict):
-        print(f"\n{'='*60}")
-        print("DISTILLATION TRAINING COMPLETED")
-        print(f"{'='*60}")
-        if 'test_accuracy' in result:
-            print(f"Experiment: {result['experiment_name']}")
-            print(f"Test Accuracy: {result['test_accuracy']:.4f}")
-            print(f"GPUs Used: {result['num_gpus']}")
-            print(f"Output Directory: {result['output_dir']}")
-        print(f"{'='*60}\n")
-
-    return 0
-
-
-def train_ss_distill_worker(
-    rank: int,
-    world_size: int,
-    config_path: str
-):
-    """DDP training worker for self-supervised (CST-style) distillation training."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29502'  # Different port from other training modes
-    os.environ['RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['LOCAL_RANK'] = str(rank)
-
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=world_size,
-        rank=rank
-    )
-
-    result = None
-    try:
-        torch.cuda.set_device(rank)
-        device = torch.device(f"cuda:{rank}")
-        is_main_process = (rank == 0)
-
-        config = ConfigManager.load_config(config_path)
-
-        if world_size > 1:
-            config.experiment_name = f"{config.experiment_name}_ddp_{world_size}gpu"
-
-        output_dir = Path(config.output_dir) / config.experiment_name
-        checkpoints_dir = output_dir / "checkpoints"
-
-        if is_main_process:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-        dist.barrier()
-
-        if is_main_process:
-            setup_logging(config.logging)
-            logger = logging.getLogger(__name__)
-            logger.info("=" * 60)
-            logger.info("Self-Supervised Token Distillation (CST-Style) Training")
-            logger.info("=" * 60)
-            logger.info(f"Experiment: {config.experiment_name}")
-            logger.info(f"Dataset: {config.data.dataset}")
-            logger.info(f"World Size: {world_size}")
-            logger.info(f"GPUs: {world_size} x {torch.cuda.get_device_name(0)}")
-            logger.info("=" * 60)
-        else:
-            logging.basicConfig(level=logging.ERROR)
-            logger = logging.getLogger(__name__)
-
-        set_seed(config.seed + rank)
-
-        # Get dataset info
-        dataset_info = DatasetManager.get_dataset_info(config)
-        config.model.in_channels = dataset_info['in_channels']
-        config.model.num_classes = dataset_info['num_classes']
-        config.model.dataset = config.data.dataset
-
-        # Validate ss_distillation config exists
-        if config.ss_distillation is None:
-            raise ValueError("ss_distillation config is required for train-ss-distill command")
-
-        # Build student model config (merge model and vit configs)
-        student_config = config.model.__dict__.copy()
-        if config.vit is not None:
-            student_config.update(config.vit.__dict__)
-
-        # Create student model (DeiT)
-        student_model = ModelFactory.create_model('deit', student_config)
-        student_model = student_model.to(device)
-
-        if is_main_process:
-            total_params = sum(p.numel() for p in student_model.parameters())
-            logger.info(f"Student model (DeiT) created with {total_params:,} parameters")
-
-        # Load self-supervised teacher (DINO/DINOv2)
-        if is_main_process:
-            logger.info(f"Loading {config.ss_distillation.teacher_type} teacher: {config.ss_distillation.teacher_model_name}")
-
-        teacher_model, teacher_embed_dim = load_dino_teacher(
-            config.ss_distillation.teacher_type,
-            config.ss_distillation.teacher_model_name,
-            device
-        )
-
-        if is_main_process:
-            teacher_params = sum(p.numel() for p in teacher_model.parameters())
-            logger.info(f"Teacher model loaded with {teacher_params:,} parameters (frozen)")
-            logger.info(f"Teacher embedding dim: {teacher_embed_dim}")
-
-        # Wrap student with DDP
-        student_model = DDP(
-            student_model,
-            device_ids=[rank],
-            output_device=rank,
-            find_unused_parameters=True  # Required for DeiT distillation token
-        )
-
-        # Create data loaders
-        # Use dual-augment loaders if enabled (clean for teacher, augmented for student)
-        use_dual_augment = getattr(config.ss_distillation, 'use_dual_augment', False)
-
-        if use_dual_augment:
-            if is_main_process:
-                logger.info("Using dual-path augmentation (clean for teacher, augmented for student)")
-            train_dataset = DatasetManager.get_dual_augment_dataset(config)
-        else:
-            train_dataset = DatasetManager.get_dataset(config, is_train=True)
-
-        val_dataset = DatasetManager.get_dataset(config, is_train=False)
-        test_dataset = DatasetManager.get_dataset(config, is_train=False)
-
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=config.seed,
-            drop_last=True
-        )
-
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.data.batch_size,
-            sampler=train_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.data.batch_size,
-            sampler=val_sampler,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory,
-            persistent_workers=config.data.persistent_workers and config.data.num_workers > 0,
-            prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else 2
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            num_workers=config.data.num_workers,
-            pin_memory=config.data.pin_memory
-        )
-
-        if is_main_process:
-            logger.info(f"Train samples: {len(train_dataset)} ({len(train_dataset)//world_size} per GPU)")
-            logger.info(f"Effective batch size: {config.data.batch_size * world_size}")
-            logger.info(f"Token layers for distillation: {config.ss_distillation.token_layers}")
-            logger.info(f"Lambda tok: {config.ss_distillation.lambda_tok}, Lambda rel: {config.ss_distillation.lambda_rel}")
-            logger.info(f"L_rel warmup epochs: {config.ss_distillation.rel_warmup_epochs}")
-
-        # Create self-supervised distillation trainer
-        ss_distill_trainer = SelfSupervisedDistillationTrainer(
-            student_model=student_model,
-            teacher_model=teacher_model,
-            teacher_embed_dim=teacher_embed_dim,
-            config=config,
-            device=device,
-            rank=rank,
-            world_size=world_size
-        )
-
-        dist.barrier()
-
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("STARTING SELF-SUPERVISED DISTILLATION TRAINING")
-            logger.info("=" * 60)
-
-        # Train
-        metrics_history = ss_distill_trainer.train_ddp(train_loader, train_sampler, val_loader)
-
-        # Evaluate on test set
-        if is_main_process:
-            logger.info("=" * 60)
-            logger.info("EVALUATING ON TEST SET")
-            logger.info("=" * 60)
-
-            # Use unwrapped model for evaluation
-            eval_model = ss_distill_trainer.ddp_model.module if hasattr(ss_distill_trainer.ddp_model, 'module') else ss_distill_trainer.ddp_model
-            evaluator = ModelEvaluator(eval_model, device, dataset_info.get('classes'))
-            test_metrics = evaluator.evaluate(test_loader)
-            evaluator.print_summary()
-
-            # Save config and visualizations
-            ConfigManager.save_config(config, output_dir / 'config.yaml')
-
-            if metrics_history:
-                TrainingVisualizer.plot_training_history(
-                    metrics_history,
-                    save_path=output_dir / 'training_history.png'
-                )
-
-            evaluator.plot_confusion_matrix(
-                save_path=output_dir / 'confusion_matrix.png',
-                normalize=True
-            )
-
-            # Save metrics
-            metrics_file = output_dir / 'test_metrics.txt'
-            with open(metrics_file, 'w') as f:
-                f.write("=" * 60 + "\n")
-                f.write("SELF-SUPERVISED TOKEN DISTILLATION (CST-STYLE) RESULTS\n")
-                f.write("=" * 60 + "\n\n")
-                f.write(f"Configuration: {world_size} GPUs with DDP\n")
-                f.write(f"Teacher: {config.ss_distillation.teacher_type} ({config.ss_distillation.teacher_model_name})\n")
-                f.write(f"Token Layers: {config.ss_distillation.token_layers}\n")
-                f.write(f"Lambda Tok: {config.ss_distillation.lambda_tok}\n")
-                f.write(f"Lambda Rel: {config.ss_distillation.lambda_rel}\n")
-                f.write(f"L_rel Warmup: {config.ss_distillation.rel_warmup_epochs} epochs\n\n")
-                f.write(f"Accuracy:          {test_metrics['accuracy']:.4f}\n")
-                f.write(f"Precision (macro): {test_metrics['precision_macro']:.4f}\n")
-                f.write(f"Recall (macro):    {test_metrics['recall_macro']:.4f}\n")
-                f.write(f"F1 Score (macro):  {test_metrics['f1_macro']:.4f}\n")
-
-            logger.info("=" * 60)
-            logger.info("SELF-SUPERVISED DISTILLATION TRAINING COMPLETED")
-            logger.info(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
-            logger.info(f"Outputs saved to: {output_dir}")
-            logger.info("=" * 60)
-
-            result = {
-                'experiment_name': config.experiment_name,
-                'test_accuracy': test_metrics['accuracy'],
-                'output_dir': str(output_dir),
-                'num_gpus': world_size
-            }
-
-    finally:
-        dist.destroy_process_group()
-
-    return result
-
-
-def train_ss_distillation_locally(config_path: str, num_gpus: int = 1):
-    """Train DeiT with self-supervised (CST-style) distillation on local GPUs using DDP."""
-    config_file = Path(config_path)
-    if not config_file.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    available_gpus = torch.cuda.device_count()
-    if available_gpus == 0:
-        raise RuntimeError("No CUDA GPUs available.")
-
-    if num_gpus > available_gpus:
-        print(f"Requested {num_gpus} GPUs, but only {available_gpus} available. Using {available_gpus}.")
-        num_gpus = available_gpus
-
-    print(f"\n{'='*60}")
-    print("Self-Supervised Token Distillation (CST-Style) Training")
-    print(f"{'='*60}")
-    print(f"Config: {config_path}")
-    print(f"GPUs: {num_gpus} x {torch.cuda.get_device_name(0)}")
-    print(f"{'='*60}\n")
-
-    if num_gpus == 1:
-        result = train_ss_distill_worker(0, 1, config_path)
-    else:
-        mp.spawn(train_ss_distill_worker, args=(num_gpus, config_path), nprocs=num_gpus, join=True)
-        result = {"status": "completed", "num_gpus": num_gpus}
-
-    if result and isinstance(result, dict):
-        print(f"\n{'='*60}")
-        print("SELF-SUPERVISED DISTILLATION TRAINING COMPLETED")
-        print(f"{'='*60}")
-        if 'test_accuracy' in result:
-            print(f"Experiment: {result['experiment_name']}")
-            print(f"Test Accuracy: {result['test_accuracy']:.4f}")
-            print(f"GPUs Used: {result['num_gpus']}")
-            print(f"Output Directory: {result['output_dir']}")
-        print(f"{'='*60}\n")
-
-    return 0
-
-
-def evaluate_model(config_path, checkpoint_path):
+# =============================================================================
+# Evaluation and Analysis Functions
+# =============================================================================
+
+def evaluate_model(config_path: str, checkpoint_path: str) -> None:
     """Evaluate a trained model on the test set."""
     config = ConfigManager.load_config(config_path)
     setup_logging(config.logging)
@@ -912,22 +659,11 @@ def evaluate_model(config_path, checkpoint_path):
     config.model.num_classes = dataset_info['num_classes']
     config.model.dataset = config.data.dataset
 
-    # Build model config (merge model and vit configs for DeiT)
-    model_config = config.model.__dict__.copy()
-    if hasattr(config, 'vit') and config.vit is not None:
-        model_config.update(config.vit.__dict__)
-
+    model_config = build_model_config(config)
     model = ModelFactory.create_model(config.model.model_type, model_config)
     model = model.to(device)
 
-    if hasattr(torch.serialization, 'add_safe_globals'):
-        torch.serialization.add_safe_globals([
-            Config,
-            DataConfig,
-            ModelConfig,
-            TrainingConfig,
-            LoggingConfig
-        ])
+    add_safe_globals_for_checkpoints()
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     logger.info(f"Loaded model from {checkpoint_path}")
@@ -936,26 +672,20 @@ def evaluate_model(config_path, checkpoint_path):
 
     evaluator = ModelEvaluator(model, device, dataset_info.get('classes'))
     evaluator.evaluate(test_loader)
-
     evaluator.print_summary()
 
     output_dir = Path(config.output_dir) / 'evaluation'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    evaluator.plot_confusion_matrix(
-        save_path=output_dir / 'confusion_matrix.png',
-        normalize=True
-    )
-
+    evaluator.plot_confusion_matrix(save_path=output_dir / 'confusion_matrix.png', normalize=True)
     evaluator.plot_roc_curves(save_path=output_dir / 'roc_curves.png')
-
     evaluator.plot_class_distribution(save_path=output_dir / 'class_distribution.png')
 
     misclassified = evaluator.get_misclassified_samples(n_samples=20)
     logger.info(f"Top misclassified samples: {misclassified[:5]}")
 
 
-def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
+def test_single_image(config_path: str, checkpoint_path: str, image_path: str, use_tta: bool = False) -> None:
     """Test model on a single image with visualization."""
     config = ConfigManager.load_config(config_path)
     setup_logging(config.logging)
@@ -967,22 +697,11 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
     config.model.num_classes = dataset_info['num_classes']
     config.model.dataset = config.data.dataset
 
-    # Build model config (merge model and vit configs for DeiT)
-    model_config = config.model.__dict__.copy()
-    if hasattr(config, 'vit') and config.vit is not None:
-        model_config.update(config.vit.__dict__)
-
+    model_config = build_model_config(config)
     model = ModelFactory.create_model(config.model.model_type, model_config)
     model = model.to(device)
 
-    if hasattr(torch.serialization, 'add_safe_globals'):
-        torch.serialization.add_safe_globals([
-            Config,
-            DataConfig,
-            ModelConfig,
-            TrainingConfig,
-            LoggingConfig
-        ])
+    add_safe_globals_for_checkpoints()
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -992,8 +711,7 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
 
     if use_tta:
         tta = TestTimeAugmentation(model, device, n_augmentations=10)
-        transforms = []
-        output = tta.predict(image, transforms)
+        output = tta.predict(image, [])
     else:
         with torch.no_grad():
             output = model(image)
@@ -1013,11 +731,11 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
         prob = top5_probs[0, i].item()
         print(f"{i+1}. {class_names[class_idx]}: {prob:.4f}")
 
+    # Visualizations
     output_dir = Path('outputs') / 'inference'
     output_dir.mkdir(parents=True, exist_ok=True)
 
     visualizer = FeatureMapVisualizer(model, device)
-
     for name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
             visualizer.visualize_feature_maps(
@@ -1038,20 +756,16 @@ def test_single_image(config_path, checkpoint_path, image_path, use_tta=False):
         original_img = np.array(original_img)
 
         gradcam = GradCAM(model, last_conv_name, device)
-        gradcam.visualize(
-            image, original_img,
-            class_idx=pred_class.item(),
-            save_path=output_dir / 'gradcam.png'
-        )
+        gradcam.visualize(image, original_img, class_idx=pred_class.item(), save_path=output_dir / 'gradcam.png')
 
 
 def analyze_model(
     config_path: str,
     checkpoint_path: str,
     metrics: str = 'all',
-    output_dir: str = None,
+    output_dir: Optional[str] = None,
     num_samples: int = 1024
-):
+) -> dict:
     """
     Run research-grade analytics on a trained model.
 
@@ -1059,13 +773,6 @@ def analyze_model(
     - Hessian trace and top eigenvalues (loss landscape curvature)
     - Mean attention distance per layer (for ViT models)
     - CKA similarity matrix (layer-wise representations)
-
-    Args:
-        config_path: Path to model configuration file
-        checkpoint_path: Path to model checkpoint
-        metrics: Comma-separated list of metrics ('hessian', 'attention', 'cka', or 'all')
-        output_dir: Directory to save results (default: outputs/analytics)
-        num_samples: Number of samples for analysis
     """
     import json
 
@@ -1075,35 +782,23 @@ def analyze_model(
     device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
     logger.info(f"Running analytics on device: {device}")
 
-    # Get dataset info
     dataset_info = DatasetManager.get_dataset_info(config)
     config.model.in_channels = dataset_info['in_channels']
     config.model.num_classes = dataset_info['num_classes']
     config.model.dataset = config.data.dataset
 
-    # Build model config (merge model and vit configs for DeiT)
-    model_config = config.model.__dict__.copy()
-    if hasattr(config, 'vit') and config.vit is not None:
-        model_config.update(config.vit.__dict__)
-
-    # Create model
+    model_config = build_model_config(config)
     model = ModelFactory.create_model(config.model.model_type, model_config)
     model = model.to(device)
 
-    # Load checkpoint
-    if hasattr(torch.serialization, 'add_safe_globals'):
-        torch.serialization.add_safe_globals([
-            Config, DataConfig, ModelConfig, TrainingConfig, LoggingConfig,
-            ViTConfig, DistillationConfig, SelfSupervisedDistillationConfig
-        ])
-
+    add_safe_globals_for_checkpoints()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     logger.info(f"Loaded model from {checkpoint_path}")
 
-    # Unwrap compiled model if necessary (CRITICAL for Hessian)
+    # Unwrap compiled model if necessary
     if hasattr(model, '_orig_mod'):
         logger.info("Unwrapping torch.compile model for analytics")
         model = model._orig_mod
@@ -1116,48 +811,35 @@ def analyze_model(
 
     logger.info(f"Analytics metrics to compute: {metric_list}")
 
-    # Create data loader for analytics
+    # Create data loader
     test_dataset = DatasetManager.get_dataset(config, is_train=False)
     test_loader = DataLoader(
         test_dataset,
-        batch_size=64,  # Smaller batch for Hessian stability
-        shuffle=True,  # Random samples
+        batch_size=64,
+        shuffle=True,
         num_workers=config.data.num_workers,
         pin_memory=config.data.pin_memory
     )
 
     # Set up output directory
-    if output_dir is None:
-        output_dir = Path(config.output_dir) / 'analytics'
-    else:
-        output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = Path(output_dir) if output_dir else Path(config.output_dir) / 'analytics'
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    # Add config parameters for analytics
+    # Analytics config
     class AnalyticsConfig:
-        def __init__(self, config, num_samples):
-            self.hessian_samples = num_samples
+        def __init__(self, cfg, n_samples):
+            self.hessian_samples = n_samples
             self.cka_kernel = 'linear'
-            # Copy vit config if available
-            if hasattr(config, 'vit') and config.vit is not None:
-                self.vit = config.vit
-            else:
-                self.vit = None
+            self.vit = cfg.vit if hasattr(cfg, 'vit') else None
 
     analytics_config = AnalyticsConfig(config, num_samples)
 
     # Run analytics
-    runner = AnalyticsRunner(
-        model=model,
-        config=analytics_config,
-        device=device,
-        teacher_model=None  # Could add teacher for comparison
-    )
-
+    runner = AnalyticsRunner(model=model, config=analytics_config, device=device, teacher_model=None)
     results = runner.run_all(
         dataloader=test_loader,
         metrics=metric_list,
-        save_path=output_dir / 'analytics_results.json'
+        save_path=out_path / 'analytics_results.json'
     )
 
     # Generate visualizations
@@ -1165,22 +847,20 @@ def analyze_model(
     logger.info("Generating Analytics Visualizations")
     logger.info("=" * 60)
 
-    # CKA Heatmap
     if 'cka' in results and 'cka_matrix' in results['cka']:
         AnalyticsVisualizer.plot_cka_heatmap(
             cka_matrix=results['cka']['cka_matrix'],
             layer_indices_x=results['cka'].get('layer_indices_1'),
             layer_indices_y=results['cka'].get('layer_indices_2'),
             title=f"CKA Similarity - {config.experiment_name}",
-            save_path=output_dir / 'cka_heatmap.png'
+            save_path=out_path / 'cka_heatmap.png'
         )
 
-    # Attention Distance
     if 'attention' in results and 'layer_distances' in results['attention']:
         AnalyticsVisualizer.plot_attention_distances(
             layer_distances=results['attention']['layer_distances'],
             title=f"Mean Attention Distance - {config.experiment_name}",
-            save_path=output_dir / 'attention_distances.png'
+            save_path=out_path / 'attention_distances.png'
         )
 
     # Print summary
@@ -1194,23 +874,26 @@ def analyze_model(
             logger.info(f"Hessian Trace: {hessian['trace']:.4f} +/- {hessian.get('trace_std', 0):.4f}")
         if 'max_eigenvalue' in hessian:
             logger.info(f"Max Eigenvalue: {hessian['max_eigenvalue']:.4f}")
-        if 'eigenvalue_ratio' in hessian:
-            logger.info(f"Eigenvalue Ratio: {hessian['eigenvalue_ratio']:.2f}")
 
     if 'attention' in results and 'mean_distance' in results['attention']:
         logger.info(f"Mean Attention Distance: {results['attention']['mean_distance']:.4f}")
 
     if 'cka' in results and 'cka_matrix' in results['cka']:
         cka_matrix = np.array(results['cka']['cka_matrix'])
-        diagonal_mean = np.diag(cka_matrix).mean() if cka_matrix.shape[0] == cka_matrix.shape[1] else 0
-        logger.info(f"CKA Diagonal Mean: {diagonal_mean:.4f}")
+        if cka_matrix.shape[0] == cka_matrix.shape[1]:
+            diagonal_mean = np.diag(cka_matrix).mean()
+            logger.info(f"CKA Diagonal Mean: {diagonal_mean:.4f}")
 
     logger.info("=" * 60)
-    logger.info(f"Analytics results saved to: {output_dir}")
+    logger.info(f"Analytics results saved to: {out_path}")
     logger.info("=" * 60)
 
     return results
 
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1220,34 +903,37 @@ def main():
 
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
 
+    # Train command
     train_parser = subparsers.add_parser('train', help='Train a model on local GPUs')
     train_parser.add_argument('config', type=str, help='Path to configuration file')
-    train_parser.add_argument('--num-gpus', type=int, default=1,
-                             help='Number of GPUs to use (default: 1)')
+    train_parser.add_argument('--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
 
+    # Evaluate command
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate a trained model locally')
     eval_parser.add_argument('config', type=str, help='Path to configuration file')
     eval_parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
 
+    # Test command
     test_parser = subparsers.add_parser('test', help='Test on single image with visualization')
     test_parser.add_argument('config', type=str, help='Path to configuration file')
     test_parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
     test_parser.add_argument('image', type=str, help='Path to input image')
     test_parser.add_argument('--tta', action='store_true', help='Use test-time augmentation')
 
+    # Distillation command
     distill_parser = subparsers.add_parser('train-distill', help='Train DeiT with knowledge distillation')
     distill_parser.add_argument('config', type=str, help='Path to DeiT config file')
-    distill_parser.add_argument('--num-gpus', type=int, default=1,
-                                help='Number of GPUs to use (default: 1)')
+    distill_parser.add_argument('--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
 
+    # Self-supervised distillation command
     ss_distill_parser = subparsers.add_parser(
         'train-ss-distill',
         help='Train DeiT with self-supervised (CST-style) token distillation from DINO/DINOv2'
     )
     ss_distill_parser.add_argument('config', type=str, help='Path to config file with ss_distillation section')
-    ss_distill_parser.add_argument('--num-gpus', type=int, default=1,
-                                   help='Number of GPUs to use (default: 1)')
+    ss_distill_parser.add_argument('--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
 
+    # Analyze command
     analyze_parser = subparsers.add_parser(
         'analyze',
         help='Run research-grade analytics on a trained model (Hessian, Attention Distance, CKA)'
@@ -1264,11 +950,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'train':
-        return train_locally(args.config, args.num_gpus)
+        return train_locally(args.config, args.num_gpus, mode='standard')
     elif args.command == 'train-distill':
-        return train_distillation_locally(args.config, args.num_gpus)
+        return train_locally(args.config, args.num_gpus, mode='distill')
     elif args.command == 'train-ss-distill':
-        return train_ss_distillation_locally(args.config, args.num_gpus)
+        return train_locally(args.config, args.num_gpus, mode='ss_distill')
     elif args.command == 'evaluate':
         evaluate_model(args.config, args.checkpoint)
     elif args.command == 'test':
