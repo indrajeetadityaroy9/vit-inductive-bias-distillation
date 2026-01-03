@@ -143,3 +143,4 @@ verification_results/
 *.jpeg
 !configs/*.png
 !docs/*.png
+*.tex
