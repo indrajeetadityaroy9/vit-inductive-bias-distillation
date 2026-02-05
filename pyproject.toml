@@ -1,73 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vit-inductive-bias-distillation"
 version = "1.0.0"
-description = "Research framework for studying inductive bias mismatch in CNN-to-ViT knowledge distillation"
-readme = "README.md"
-license = {text = "MIT"}
 requires-python = ">=3.10"
-authors = [{name = "Author"}]
-keywords = ["deep-learning", "knowledge-distillation", "vision-transformer", "pytorch"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-
 dependencies = [
-    "torch>=2.2.0",
-    "torchvision>=0.17.0",
-    "numpy>=1.26.0",
-    "Pillow>=10.0.0",
-    "scikit-learn>=1.4.0",
-    "scipy>=1.12.0",
-    "PyYAML>=6.0",
-    "tqdm>=4.66.0",
-    "timm>=0.9.12",
-    "einops>=0.7.0",
+    "torch==2.2.0",
+    "torchvision==0.17.0",
+    "numpy==1.26.0",
+    "PyYAML==6.0",
+    "tqdm==4.66.0",
+    "timm==0.9.12",
+    "scikit-learn==1.4.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "black>=24.0.0",
-    "flake8>=7.0.0",
-    "mypy>=1.8.0",
-    "isort>=5.13.0",
-]
-analytics = [
-    "pyhessian",
-]
-h100 = [
-    "flash-attn>=2.5.0",
-]
-
-[project.scripts]
-vit-distill = "src.__main__:main"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
-
-[tool.black]
-line-length = 100
-target-version = ["py310", "py311"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.mypy]
-python_version = "3.10"
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-v --tb=short"
-pythonpath = ["."]
+[tool.setuptools]
+packages = ["src", "src.*"]
