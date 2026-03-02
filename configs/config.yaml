@@ -1,0 +1,45 @@
+defaults:
+  - _self_
+  - optional experiment: null
+
+run:
+  name: basd_imagenet
+  output_dir: ./outputs
+  seed: 42
+
+data:
+  dataset: ILSVRC/imagenet-1k
+  eval_datasets:
+    - barkermrl/imagenet-a
+    - songweig/imagenet_sketch
+  batch_size: 256
+  eval_crop_ratio: ${eval_crop_ratio:${model.vit.img_size},${model.vit.patch_size}}
+
+model:
+  student_preset: deit_tiny_patch16_224
+  drop_path_rate: 0.1
+  num_classes: ${num_classes:${data.dataset}}
+  arch_overrides: {}
+  vit:
+    img_size: 224
+    patch_size: 16
+
+checkpoint:
+  resume_from: null
+  path: null
+
+training:
+  mode: distill
+  num_epochs: 300
+  learning_rate: 1.0e-3
+  weight_decay: 0.05
+  label_smoothing: ${label_smoothing:${data.dataset}}
+
+basd:
+  teacher_model_name: dinov2_vitb14
+  num_extraction_points: 4
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

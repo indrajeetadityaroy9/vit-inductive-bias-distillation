@@ -1,6 +1,6 @@
+# @package _global_
 # Table 2: Cross-architecture distillation (ConvNeXt-Tiny teacher)
 run:
   name: basd_imagenet_cross_arch
 basd:
-  teacher_model_name: convnextv2_tiny
-  teacher_loader: timm
+  teacher_model_name: convnextv2_tiny.fcmae

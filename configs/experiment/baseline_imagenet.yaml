@@ -1,3 +1,4 @@
+# @package _global_
 # Table 1: DeiT-Tiny baseline (no distillation)
 run:
   name: baseline_imagenet

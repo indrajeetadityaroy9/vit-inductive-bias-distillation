@@ -8,25 +8,24 @@ import torch.nn.functional as F
 class AttentionDistillationLoss(nn.Module):
     def __init__(
         self,
-        student_heads_per_layer: int,
-        teacher_heads_per_layer: int,
+        student_heads_per_layer: list[int],
+        teacher_heads_per_layer: list[int],
         num_layers: int,
         *,
         init_temperature: float = 1.0,
     ):
         super().__init__()
-        self.student_heads_per_layer = student_heads_per_layer
-        self.teacher_heads_per_layer = teacher_heads_per_layer
-        self.num_layers = num_layers
 
-        total_student_heads = student_heads_per_layer * num_layers
-        total_teacher_heads = teacher_heads_per_layer * num_layers
+        self.head_aligners = nn.ModuleList([
+            nn.Conv2d(
+                student_heads_per_layer[i], teacher_heads_per_layer[i],
+                kernel_size=1, bias=False,
+            )
+            for i in range(num_layers)
+        ])
+        for aligner in self.head_aligners:
+            nn.init.kaiming_normal_(aligner.weight, mode="fan_out", nonlinearity="linear")
 
-        self.head_aligner = nn.Conv2d(
-            total_student_heads, total_teacher_heads,
-            kernel_size=1, bias=False,
-        )
-        nn.init.kaiming_normal_(self.head_aligner.weight, mode="fan_out", nonlinearity="linear")
         self._raw_temperature = nn.Parameter(
             torch.tensor(math.log(math.exp(init_temperature) - 1.0))
         )
@@ -53,19 +52,16 @@ class AttentionDistillationLoss(nn.Module):
         teacher_attns: dict[int, torch.Tensor],
         layer_indices: list[int],
     ) -> torch.Tensor:
-        s_stacked = torch.cat(
-            [student_attns[layer] for layer in layer_indices], dim=1
-        )
-
-        aligned_logits = self.head_aligner(s_stacked)
-        N_s = s_stacked.shape[2]
-
-        aligned_per_layer = aligned_logits.split(self.teacher_heads_per_layer, dim=1)
-
         losses = []
         for i, layer in enumerate(layer_indices):
-            t_attn = self._align_resolution(teacher_attns[layer], N_s)
-            s_log_prob = F.log_softmax(aligned_per_layer[i] / self.temperature, dim=-1)
+            s_attn = student_attns[layer]
+            t_attn = teacher_attns[layer]
+
+            N_s = s_attn.shape[2]
+            t_attn = self._align_resolution(t_attn, N_s)
+
+            aligned = self.head_aligners[i](s_attn)
+            s_log_prob = F.log_softmax(aligned / self.temperature, dim=-1)
             losses.append(F.kl_div(s_log_prob, t_attn, reduction="batchmean"))
 
         return torch.stack(losses).mean()

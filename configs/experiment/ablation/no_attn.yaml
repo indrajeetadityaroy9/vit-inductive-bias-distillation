@@ -1,5 +1,0 @@
-# Table 4: Ablation — disable attention transfer
-run:
-  name: ablation_no_attn
-basd:
-  disabled_components: [attn]

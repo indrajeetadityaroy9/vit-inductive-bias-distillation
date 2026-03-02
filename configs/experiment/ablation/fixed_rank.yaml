@@ -1,5 +1,0 @@
-# Table 5: Ablation — fixed rank layer selector (vs Marchenko-Pastur auto-rank)
-run:
-  name: ablation_fixed_rank
-basd:
-  layer_selector_fixed_rank: 8

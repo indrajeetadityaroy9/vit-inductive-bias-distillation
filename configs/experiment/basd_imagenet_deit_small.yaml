@@ -1,5 +1,7 @@
-# Table 1: BASD DeiT-Small on ImageNet-1k
+# @package _global_
+# Table 1: BASD with ViT-L teacher on ImageNet-1k
+# Larger teacher → higher intrinsic dim → larger student.
 run:
   name: basd_imagenet_deit_small
-model:
-  student_preset: deit_small
+basd:
+  teacher_model_name: dinov2_vitl14

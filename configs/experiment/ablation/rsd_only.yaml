@@ -1,5 +1,0 @@
-# Table 4: Ablation — RSD only (disable DSGT + attention)
-run:
-  name: ablation_rsd_only
-basd:
-  disabled_components: [dsgt, attn]

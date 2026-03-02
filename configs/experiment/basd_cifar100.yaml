@@ -1,3 +1,4 @@
+# @package _global_
 # Table 3: BASD DeiT-Tiny on CIFAR-100
 run:
   name: basd_cifar100
@@ -6,6 +7,8 @@ data:
   eval_datasets: []
   batch_size: 128
 model:
+  student_preset: deit_tiny_patch16_224
+  drop_path_rate: 0.05
   vit:
     img_size: 32
     patch_size: 4

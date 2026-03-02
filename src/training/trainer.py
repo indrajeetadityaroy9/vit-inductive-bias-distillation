@@ -1,4 +1,3 @@
-import itertools
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -6,46 +5,39 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from accelerate import Accelerator
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from schedulefree import AdamWScheduleFree
 
 from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
 from src.evaluation.metrics import evaluate_model
 from src.losses.combined import BASDLoss
-from src.models.teacher import TeacherModel, extract_intermediates
+from src.models.teacher import TeacherModel, extract_intermediates, _make_attn_capture_hook
 
 
 @torch.compiler.disable
 def _extract_student(
     model: nn.Module, x: torch.Tensor, layer_indices: list[int],
+    *, layer_paths: list[str], attn_subpath: str | None, has_cls_token: bool,
 ) -> tuple[torch.Tensor, dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-    """Run student forward with hooks to capture intermediates and attention."""
     hooks = []
     captured_tokens = {}
     captured_attns = {}
 
     for idx in layer_indices:
-        block = model.blocks[idx]
+        block = model.get_submodule(layer_paths[idx])
 
-        def make_token_hook(i):
+        def make_token_hook(i, _has_cls=has_cls_token):
             def hook(mod, inp, out):
-                captured_tokens[i] = out[:, 1:, :]
+                captured_tokens[i] = out[:, 1:, :] if _has_cls else out
             return hook
         hooks.append(block.register_forward_hook(make_token_hook(idx)))
 
-        def make_attn_hook(i):
-            def hook(mod, inp, out):
-                x_in = inp[0]
-                B, N, C = x_in.shape
-                nh = mod.num_heads
-                hd = C // nh
-                qkv = mod.qkv(x_in).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
-                q, k, _ = qkv.unbind(0)
-                captured_attns[i] = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-            return hook
-        hooks.append(block.attn.register_forward_hook(make_attn_hook(idx)))
+        if attn_subpath is not None:
+            attn_mod = model.get_submodule(f"{layer_paths[idx]}.{attn_subpath}")
+            hooks.append(attn_mod.register_forward_hook(
+                _make_attn_capture_hook(captured_attns, idx, apply_softmax=False)
+            ))
 
     logits = model(x)
     for h in hooks:
@@ -61,81 +53,68 @@ class Trainer:
         config,
         accelerator: Accelerator,
         teacher: TeacherModel | None = None,
+        *,
+        student_info: dict | None = None,
     ):
         self.accelerator = accelerator
         self.device = accelerator.device
         self.config = config
         self.distill = teacher is not None
 
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.optimizer = optim.AdamW(
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
+        self.optimizer = AdamWScheduleFree(
             student_model.parameters(),
             lr=config.training.learning_rate,
-            weight_decay=0.05,
-            fused=True,
-        )
-
-        warmup_epochs = max(1, int(0.05 * config.training.num_epochs))
-        self.scheduler = optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[
-                optim.lr_scheduler.LinearLR(
-                    self.optimizer,
-                    start_factor=1.0 / warmup_epochs,
-                    total_iters=warmup_epochs,
-                ),
-                optim.lr_scheduler.CosineAnnealingLR(
-                    self.optimizer,
-                    T_max=config.training.num_epochs,
-                    eta_min=1e-6,
-                ),
-            ],
-            milestones=[warmup_epochs],
+            weight_decay=config.training.weight_decay,
         )
 
         if self.distill:
             self._teacher = teacher
-            student_embed_dim = student_model.embed_dim
-            student_num_tokens = student_model.patch_embed.num_patches
-            cross_attn_num_heads = max(1, teacher.embed_dim // 64)
+            self._student_layer_paths = student_info['layer_paths']
+            self._student_attn_subpath = student_info['attn_subpath']
+            self._student_has_cls = student_info['has_cls_token']
+
+            student_heads = student_info['heads_per_layer']
+            teacher_heads = teacher.heads_per_layer
 
             self.basd_loss = BASDLoss(
                 base_criterion=self.criterion,
-                student_dim=student_embed_dim,
+                student_dim=student_info['embed_dim'],
                 teacher_dim=teacher.embed_dim,
-                student_depth=student_model.depth,
-                num_student_tokens=student_num_tokens,
-                cross_attn_num_heads=cross_attn_num_heads,
+                student_depth=student_info['depth'],
+                num_student_tokens=student_info['num_tokens'],
+                cross_attn_num_heads=teacher.heads_per_layer[0],
                 config=config.basd,
-                student_num_heads=config.model.vit.num_heads,
-                teacher_num_heads=teacher.num_heads,
+                student_heads_per_layer=[
+                    student_heads[min(i, len(student_heads) - 1)]
+                    for i in range(config.basd.num_extraction_points)
+                ],
+                teacher_heads_per_layer=[
+                    teacher_heads[min(i, len(teacher_heads) - 1)]
+                    for i in range(config.basd.num_extraction_points)
+                ],
+                teacher_has_cls_token=teacher.has_cls_token,
+                teacher_feature_format=teacher.feature_format,
             ).to(self.device)
-
-            self.token_layers = list(self.basd_loss.token_layers)
 
             self.optimizer.add_param_group({
                 "params": list(self.basd_loss.parameters()),
-                "lr": config.training.learning_rate,
             })
 
-        self.model, self.optimizer, self.scheduler = accelerator.prepare(
-            student_model, self.optimizer, self.scheduler
+        student_model = torch.compile(student_model, mode="max-autotune")
+
+        self.model, self.optimizer = accelerator.prepare(
+            student_model, self.optimizer
         )
 
         if self.distill:
             accelerator.register_for_checkpointing(self.basd_loss)
 
-        self.model = torch.compile(self.model, mode="max-autotune")
-
-        self.ema_model = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn(0.9999))
-        accelerator.register_for_checkpointing(self.ema_model)
-
-        self.current_epoch = 0
         self.best_val_acc = 0.0
         self.metrics_history = defaultdict(list)
 
         self.mixup_cutmix = RandomChoice([
-            MixUp(alpha=0.8, num_classes=config.model.num_classes),
+            MixUp(alpha=1.0, num_classes=config.model.num_classes),
             CutMix(alpha=1.0, num_classes=config.model.num_classes),
         ])
 
@@ -148,16 +127,11 @@ class Trainer:
             "best_val_acc": self.best_val_acc,
             "metrics_history": self.metrics_history,
         }
-        if self.distill:
-            custom_state["uwso_temperature"] = self.basd_loss.uwso_temperature
         torch.save(custom_state, checkpoint_dir / "custom_state.pth")
-        print(f"event=checkpoint_saved path={checkpoint_dir} epoch={epoch + 1} name={name}")
 
-    def save_weights(self, filename: str, epoch: int, *, ema: bool = False) -> None:
+    def save_weights(self, filename: str, epoch: int) -> None:
         checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        source = self.ema_model.module if ema else self.model
-        unwrapped = self.accelerator.unwrap_model(source)
+        unwrapped = self.accelerator.unwrap_model(self.model)
         torch.save(
             {"epoch": epoch, "model_state_dict": unwrapped.state_dict()},
             checkpoint_dir / filename,
@@ -173,8 +147,6 @@ class Trainer:
         )
         self.best_val_acc = custom["best_val_acc"]
         self.metrics_history = defaultdict(list, custom["metrics_history"])
-        if self.distill:
-            self.basd_loss.uwso_temperature = custom["uwso_temperature"]
         return custom["epoch"] + 1
 
     def _train_epoch_baseline(
@@ -196,13 +168,7 @@ class Trainer:
                 loss = self.criterion(logits, mixed_targets)
 
             self.accelerator.backward(loss)
-
-            self.accelerator.clip_grad_norm_(
-                self.model.parameters(),
-                1.0,
-            )
             self.optimizer.step()
-            self.ema_model.update_parameters(self.model)
             self.optimizer.zero_grad()
 
             n = targets.size(0)
@@ -235,7 +201,10 @@ class Trainer:
 
             with self.accelerator.autocast():
                 student_logits, s_tokens, s_attns = _extract_student(
-                    self.model, student_imgs, self.token_layers,
+                    self.model, student_imgs, self.basd_loss.token_layers,
+                    layer_paths=self._student_layer_paths,
+                    attn_subpath=self._student_attn_subpath,
+                    has_cls_token=self._student_has_cls,
                 )
 
                 teacher_tokens, teacher_attns = extract_intermediates(self._teacher, clean_imgs)
@@ -250,14 +219,8 @@ class Trainer:
                 )
 
             self.accelerator.backward(loss)
-
-            self.accelerator.clip_grad_norm_(
-                itertools.chain(self.model.parameters(), self.basd_loss.parameters()),
-                1.0,
-            )
             self.optimizer.step()
             self.basd_loss.project_to_stiefel()
-            self.ema_model.update_parameters(self.model)
             self.optimizer.zero_grad()
 
             n = targets.size(0)
@@ -283,22 +246,21 @@ class Trainer:
         num_epochs = self.config.training.num_epochs
 
         for epoch in range(start_epoch, num_epochs):
-            self.current_epoch = epoch
             epoch_start_time = time.time()
 
+            self.optimizer.train()
             self.model.train()
             if self.distill:
                 train_metrics = self._train_epoch_distill(train_loader)
             else:
                 train_metrics = self._train_epoch_baseline(train_loader)
 
+            self.optimizer.eval()
             val_metrics = evaluate_model(
                 self.model, val_loader, self.device,
                 criterion=self.criterion,
                 num_classes=self.config.model.num_classes,
             )
-
-            self.scheduler.step()
 
             epoch_time = time.time() - epoch_start_time
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -339,10 +301,9 @@ class Trainer:
                 self.save_checkpoint("best_model", epoch)
                 self.save_weights("best_model.pth", epoch)
 
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}", epoch)
+            self.save_checkpoint("latest", epoch)
 
-        self.save_weights("ema_model.pth", epoch, ema=True)
+        self.save_weights("final_model.pth", num_epochs - 1)
         print(f"event=train_complete best_val_acc={self.best_val_acc:.4f}")
 
         return self.metrics_history

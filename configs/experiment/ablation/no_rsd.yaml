@@ -1,5 +1,0 @@
-# Table 4: Ablation — disable RSD component
-run:
-  name: ablation_no_rsd
-basd:
-  disabled_components: [rsd]

@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 
 
 def bures_wasserstein_loss(
@@ -11,15 +10,6 @@ def bures_wasserstein_loss(
     """
     s = student_tokens.float()
     t = teacher_tokens.float()
-
-    # Align channel dimensions before moment matching.
-    D_s, D_t = s.shape[2], t.shape[2]
-    if D_s != D_t:
-        target_d = min(D_s, D_t)
-        if D_s > D_t:
-            s = F.adaptive_avg_pool1d(s, target_d)
-        else:
-            t = F.adaptive_avg_pool1d(t, target_d)
 
     B, N, D = s.shape
 
@@ -48,8 +38,4 @@ def bures_wasserstein_loss(
         trace_t = torch.diagonal(cov_t, dim1=-2, dim2=-1).sum(-1)
         cov_loss = (trace_s + trace_t - 2 * nuclear).mean()
 
-    # Keep mean and covariance terms on comparable scales.
-    with torch.no_grad():
-        scale = cov_loss / (mean_loss + 1e-8)
-
-    return scale * mean_loss + cov_loss
+    return mean_loss + cov_loss

@@ -11,10 +11,12 @@ from torchmetrics.classification import (
     MulticlassCalibrationError,
 )
 
-from src.config import save_config
+from omegaconf import OmegaConf
+
 from src.data.datasets import (
     create_eval_loader,
-    get_dataset_info,
+    dataset_info,
+    get_channel_stats,
     get_subset_indices,
 )
 
@@ -117,24 +119,24 @@ def evaluate_on_datasets(
     primary_results = {}
     robustness_results = {}
 
-    primary_info = get_dataset_info(primary_dataset)
-    mean, std = primary_info["mean"], primary_info["std"]
+    mean, std = get_channel_stats(primary_dataset)
+
+    crop_ratio = config.data.eval_crop_ratio
+
+    primary_num_classes = dataset_info(primary_dataset)["num_classes"]
 
     for ds_name in dataset_names:
-        info = get_dataset_info(ds_name, primary_dataset=primary_dataset)
         loader = create_eval_loader(
             ds_name,
             image_size=config.model.vit.img_size,
             batch_size=config.data.batch_size,
             mean=mean,
             std=std,
+            crop_ratio=crop_ratio,
         )
 
-        valid_indices = (
-            get_subset_indices(ds_name, primary_dataset)
-            if "parent_dataset" in info else None
-        )
-        num_classes = len(valid_indices) if valid_indices is not None else info["num_classes"]
+        valid_indices = get_subset_indices(ds_name, primary_dataset)
+        num_classes = len(valid_indices) if valid_indices is not None else primary_num_classes
 
         metrics = evaluate_model(
             model, loader, device, criterion,
@@ -199,7 +201,7 @@ def save_metrics(
     config,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, output_dir / "config.yaml")
+    OmegaConf.save(config, output_dir / "config.yaml")
     metrics_path = output_dir / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(results, f, indent=2)
