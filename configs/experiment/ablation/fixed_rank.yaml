@@ -1,15 +1,5 @@
+# Table 5: Ablation — fixed rank layer selector (vs Marchenko-Pastur auto-rank)
 run:
   name: ablation_fixed_rank
-
-data:
-  dataset: ILSVRC/imagenet-1k
-  eval_datasets:
-    - barkermrl/imagenet-a
-    - axiong/imagenet-r
-    - songweig/imagenet_sketch
-
-model:
-  student_preset: deit_tiny
-
 basd:
   layer_selector_fixed_rank: 8

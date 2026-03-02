@@ -1,20 +1,8 @@
-from __future__ import annotations
-
 import math
-from typing import Literal, NamedTuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
-from vit_inductive_bias_distillation.config import Config
-
-
-class StudentIntermediates(NamedTuple):
-    output: torch.Tensor
-    intermediates: dict[int, torch.Tensor]
-    attention_weights: dict[int, torch.Tensor]
 
 
 class DropPath(nn.Module):
@@ -49,24 +37,11 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        output_mode: Literal["features_only", "with_attention"] = "features_only",
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-
-        if output_mode == "with_attention":
-            scale = self.head_dim ** -0.5
-            attn_logits = (q @ k.transpose(-2, -1)) * scale
-            attn_probs = attn_logits.softmax(dim=-1)
-            x = (attn_probs @ v).transpose(1, 2).reshape(B, N, C)
-            return self.proj(x), attn_logits
-
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
 
@@ -98,7 +73,7 @@ class Block(nn.Module):
 
 
 class DeiT(nn.Module):
-    def __init__(self, vit_config: Config, model_config: Config):
+    def __init__(self, vit_config, model_config):
         super().__init__()
 
         self.num_classes = model_config.num_classes
@@ -114,7 +89,7 @@ class DeiT(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, vit_config.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, vit_config.embed_dim))
 
-        dpr = torch.linspace(0, vit_config.drop_path_rate, vit_config.depth).tolist()
+        dpr = torch.linspace(0, 0.1, vit_config.depth).tolist()
         self.blocks = nn.ModuleList([
             Block(vit_config.embed_dim, vit_config.num_heads, mlp_ratio=4.0, drop_path=dpr[i])
             for i in range(vit_config.depth)
@@ -130,47 +105,24 @@ class DeiT(nn.Module):
     def _init_module(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            nn.init.zeros_(m.bias)
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Conv2d):
             fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels // m.groups
             nn.init.normal_(m.weight, std=math.sqrt(2.0 / fan_out))
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            nn.init.zeros_(m.bias)
 
-    def forward(
-        self, x: torch.Tensor, *, layer_indices: list[int] = ()
-    ) -> StudentIntermediates:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         x = self.patch_embed(x)
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         x = x + self.pos_embed
-
-        layer_set = set(layer_indices)
-        intermediates: dict[int, torch.Tensor] = {}
-        attention_weights: dict[int, torch.Tensor] = {}
-
-        for idx, block in enumerate(self.blocks):
-            if idx in layer_set:
-                normed = block.norm1(x)
-                attn_out, attn_w = block.attn(normed, output_mode="with_attention")
-                attention_weights[idx] = attn_w
-                x = x + block.drop_path(attn_out)
-                x = x + block.drop_path(block.mlp(block.norm2(x)))
-                intermediates[idx] = x[:, 1:, :].clone()
-            elif self.training:
+        for block in self.blocks:
+            if self.training:
                 x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
-
         x = self.norm(x)
-        cls_out = self.head(x[:, 0])
-
-        return StudentIntermediates(
-            output=cls_out,
-            intermediates=intermediates,
-            attention_weights=attention_weights,
-        )
+        return self.head(x[:, 0])

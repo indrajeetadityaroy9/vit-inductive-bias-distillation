@@ -1,14 +1,12 @@
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator
 
-from vit_inductive_bias_distillation.config import load_config, setup_torch_backends
-from vit_inductive_bias_distillation.evaluation.metrics import run_eval_suite, save_metrics
-from vit_inductive_bias_distillation.models.deit import DeiT
+from src.config import load_config
+from src.evaluation.metrics import run_eval_suite, save_metrics
+from src.models.deit import DeiT
 
 
 def main() -> None:
@@ -16,14 +14,18 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True, help="Path to experiment config YAML")
     args = parser.parse_args()
 
-    setup_torch_backends()
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     config = load_config(args.config)
+    torch.manual_seed(config.run.seed)
 
     accelerator = Accelerator()
 
     model = DeiT(config.model.vit, config.model).to(accelerator.device)
 
-    ckpt = torch.load(config.checkpoint.path, map_location=accelerator.device)
+    ckpt = torch.load(config.checkpoint.path, map_location=accelerator.device, weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"event=checkpoint_loaded path={config.checkpoint.path} epoch={ckpt['epoch']}")
 

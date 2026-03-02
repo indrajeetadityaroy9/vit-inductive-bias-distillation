@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import time
 from pathlib import Path
@@ -13,9 +11,8 @@ from torchmetrics.classification import (
     MulticlassCalibrationError,
 )
 
-from vit_inductive_bias_distillation.config import Config, save_config
-from vit_inductive_bias_distillation.data.datasets import (
-    _resolve_channel_stats,
+from src.config import save_config
+from src.data.datasets import (
     create_eval_loader,
     get_dataset_info,
     get_subset_indices,
@@ -34,19 +31,18 @@ def evaluate_model(
 ) -> dict[str, Any]:
     model.eval()
 
-    top_k = min(5, num_classes)
     acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").to(device)
-    acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=top_k, average="micro").to(device)
+    acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro").to(device)
     ece = MulticlassCalibrationError(num_classes=num_classes, n_bins=15, norm="l1").to(device)
 
     total_loss = 0.0
     total = 0
 
     for batch in data_loader:
-        inputs = batch["pixel_values"].to(device, non_blocking=True)
-        targets = batch["label"].to(device, non_blocking=True)
+        inputs = batch["pixel_values"].to(device)
+        targets = batch["label"].to(device)
 
-        outputs = model(inputs).output
+        outputs = model(inputs)
 
         if valid_indices is not None:
             outputs = outputs[:, valid_indices]
@@ -71,7 +67,7 @@ def measure_efficiency(
     model: nn.Module,
     device: torch.device,
     *,
-    image_size: int = 224,
+    image_size: int,
     in_channels: int = 3,
     batch_size: int = 64,
     num_warmup: int = 50,
@@ -111,32 +107,34 @@ def measure_efficiency(
 
 def evaluate_on_datasets(
     model: nn.Module,
-    config: Config,
+    config,
     device: torch.device,
     criterion: nn.Module,
     *,
     dataset_names: list[str],
     primary_dataset: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    primary_results: dict[str, Any] = {}
-    robustness_results: dict[str, Any] = {}
+    primary_results = {}
+    robustness_results = {}
 
-    mean, std = _resolve_channel_stats(config, primary_dataset)
+    primary_info = get_dataset_info(primary_dataset)
+    mean, std = primary_info["mean"], primary_info["std"]
 
     for ds_name in dataset_names:
-        info = get_dataset_info(ds_name)
+        info = get_dataset_info(ds_name, primary_dataset=primary_dataset)
         loader = create_eval_loader(
             ds_name,
             image_size=config.model.vit.img_size,
             batch_size=config.data.batch_size,
-            num_workers=config.data.num_workers,
             mean=mean,
             std=std,
-            eval_resize_padding=config.data.eval_resize_padding,
         )
 
-        valid_indices = get_subset_indices(ds_name) if "parent_dataset" in info else None
-        num_classes = len(valid_indices) if valid_indices else info["num_classes"]
+        valid_indices = (
+            get_subset_indices(ds_name, primary_dataset)
+            if "parent_dataset" in info else None
+        )
+        num_classes = len(valid_indices) if valid_indices is not None else info["num_classes"]
 
         metrics = evaluate_model(
             model, loader, device, criterion,
@@ -159,7 +157,7 @@ def evaluate_on_datasets(
 
 def run_eval_suite(
     model: nn.Module,
-    config: Config,
+    config,
     device: torch.device,
     *,
     config_path: str,
@@ -198,7 +196,7 @@ def run_eval_suite(
 def save_metrics(
     results: dict[str, Any],
     output_dir: Path,
-    config: Config,
+    config,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, output_dir / "config.yaml")

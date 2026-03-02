@@ -1,15 +1,5 @@
+# Table 4: Ablation — disable attention transfer
 run:
   name: ablation_no_attn
-
-data:
-  dataset: ILSVRC/imagenet-1k
-  eval_datasets:
-    - barkermrl/imagenet-a
-    - axiong/imagenet-r
-    - songweig/imagenet_sketch
-
-model:
-  student_preset: deit_tiny
-
 basd:
   disabled_components: [attn]

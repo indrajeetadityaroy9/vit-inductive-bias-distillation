@@ -1,15 +1,5 @@
+# Table 4: Ablation — RSD only (disable DSGT + attention)
 run:
   name: ablation_rsd_only
-
-data:
-  dataset: ILSVRC/imagenet-1k
-  eval_datasets:
-    - barkermrl/imagenet-a
-    - axiong/imagenet-r
-    - songweig/imagenet_sketch
-
-model:
-  student_preset: deit_tiny
-
 basd:
-  disabled_components: [rel, attn, spectral]
+  disabled_components: [dsgt, attn]

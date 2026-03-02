@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import itertools
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -9,21 +8,57 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from accelerate import Accelerator
-from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
-from vit_inductive_bias_distillation.config import Config
-from vit_inductive_bias_distillation.evaluation.metrics import evaluate_model
-from vit_inductive_bias_distillation.losses.combined import BASDLoss
-from vit_inductive_bias_distillation.models.teacher import TeacherModel, extract_intermediates
+from src.evaluation.metrics import evaluate_model
+from src.losses.combined import BASDLoss
+from src.models.teacher import TeacherModel, extract_intermediates
+
+
+@torch.compiler.disable
+def _extract_student(
+    model: nn.Module, x: torch.Tensor, layer_indices: list[int],
+) -> tuple[torch.Tensor, dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """Run student forward with hooks to capture intermediates and attention."""
+    hooks = []
+    captured_tokens = {}
+    captured_attns = {}
+
+    for idx in layer_indices:
+        block = model.blocks[idx]
+
+        def make_token_hook(i):
+            def hook(mod, inp, out):
+                captured_tokens[i] = out[:, 1:, :]
+            return hook
+        hooks.append(block.register_forward_hook(make_token_hook(idx)))
+
+        def make_attn_hook(i):
+            def hook(mod, inp, out):
+                x_in = inp[0]
+                B, N, C = x_in.shape
+                nh = mod.num_heads
+                hd = C // nh
+                qkv = mod.qkv(x_in).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
+                q, k, _ = qkv.unbind(0)
+                captured_attns[i] = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+            return hook
+        hooks.append(block.attn.register_forward_hook(make_attn_hook(idx)))
+
+    logits = model(x)
+    for h in hooks:
+        h.remove()
+
+    return logits, captured_tokens, captured_attns
 
 
 class Trainer:
     def __init__(
         self,
         student_model: nn.Module,
-        config: Config,
+        config,
         accelerator: Accelerator,
         teacher: TeacherModel | None = None,
     ):
@@ -32,30 +67,30 @@ class Trainer:
         self.config = config
         self.distill = teacher is not None
 
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.optimizer = optim.AdamW(
             student_model.parameters(),
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
+            weight_decay=0.05,
             fused=True,
         )
 
-        self.warmup_epochs = max(1, int(config.training.warmup_fraction * config.training.num_epochs))
+        warmup_epochs = max(1, int(0.05 * config.training.num_epochs))
         self.scheduler = optim.lr_scheduler.SequentialLR(
             self.optimizer,
             schedulers=[
                 optim.lr_scheduler.LinearLR(
                     self.optimizer,
-                    start_factor=1.0 / self.warmup_epochs,
-                    total_iters=self.warmup_epochs,
+                    start_factor=1.0 / warmup_epochs,
+                    total_iters=warmup_epochs,
                 ),
                 optim.lr_scheduler.CosineAnnealingLR(
                     self.optimizer,
                     T_max=config.training.num_epochs,
-                    eta_min=config.training.cosine_eta_min,
+                    eta_min=1e-6,
                 ),
             ],
-            milestones=[self.warmup_epochs],
+            milestones=[warmup_epochs],
         )
 
         if self.distill:
@@ -92,56 +127,39 @@ class Trainer:
 
         self.model = torch.compile(self.model, mode="max-autotune")
 
-        self.swa_model = AveragedModel(self.model)
-        self.swa_scheduler = SWALR(self.optimizer, swa_lr=config.training.swa_lr)
-        self.swa_start_epoch = int(config.training.swa_start_epoch * config.training.num_epochs)
-        accelerator.register_for_checkpointing(self.swa_model)
+        self.ema_model = AveragedModel(self.model, multi_avg_fn=get_ema_multi_avg_fn(0.9999))
+        accelerator.register_for_checkpointing(self.ema_model)
 
-        self.early_stopping_patience = config.training.early_stopping_patience
-        self.early_stopping_min_delta = config.training.early_stopping_min_delta
-        self._early_stop_counter = 0
-        self._early_stop_best_score = -float("inf")
-
-        self._grad_clip_norm = config.training.grad_clip_norm
         self.current_epoch = 0
         self.best_val_acc = 0.0
-        self.metrics_history: dict[str, list[Any]] = defaultdict(list)
+        self.metrics_history = defaultdict(list)
 
         self.mixup_cutmix = RandomChoice([
             MixUp(alpha=0.8, num_classes=config.model.num_classes),
             CutMix(alpha=1.0, num_classes=config.model.num_classes),
         ])
 
-    def save_checkpoint(self, name: str, epoch: int, metrics: dict[str, Any]) -> None:
+    def save_checkpoint(self, name: str, epoch: int) -> None:
         checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints" / name
         self.accelerator.save_state(str(checkpoint_dir))
 
         custom_state = {
             "epoch": epoch,
             "best_val_acc": self.best_val_acc,
-            "metrics_history": dict(self.metrics_history),
+            "metrics_history": self.metrics_history,
         }
         if self.distill:
-            custom_state["schedule_state"] = self.basd_loss.schedule.state_dict()
-            custom_state["lagrangian_state"] = self.basd_loss.lagrangian_reg.state_dict()
+            custom_state["uwso_temperature"] = self.basd_loss.uwso_temperature
         torch.save(custom_state, checkpoint_dir / "custom_state.pth")
         print(f"event=checkpoint_saved path={checkpoint_dir} epoch={epoch + 1} name={name}")
 
-    def save_model_for_eval(self, filename: str, epoch: int) -> None:
+    def save_weights(self, filename: str, epoch: int, *, ema: bool = False) -> None:
         checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        unwrapped = self.accelerator.unwrap_model(self.model)
+        source = self.ema_model.module if ema else self.model
+        unwrapped = self.accelerator.unwrap_model(source)
         torch.save(
             {"epoch": epoch, "model_state_dict": unwrapped.state_dict()},
-            checkpoint_dir / filename,
-        )
-
-    def save_swa_for_eval(self, filename: str, epoch: int) -> None:
-        checkpoint_dir = Path(self.config.run.output_dir) / self.config.run.name / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        unwrapped_swa = self.accelerator.unwrap_model(self.swa_model.module)
-        torch.save(
-            {"epoch": epoch, "model_state_dict": unwrapped_swa.state_dict()},
             checkpoint_dir / filename,
         )
 
@@ -151,39 +169,13 @@ class Trainer:
         custom = torch.load(
             Path(checkpoint_path) / "custom_state.pth",
             map_location=self.device,
+            weights_only=True,
         )
         self.best_val_acc = custom["best_val_acc"]
         self.metrics_history = defaultdict(list, custom["metrics_history"])
         if self.distill:
-            self.basd_loss.schedule.load_state_dict(custom["schedule_state"])
-            self.basd_loss.lagrangian_reg.load_state_dict(custom["lagrangian_state"])
+            self.basd_loss.uwso_temperature = custom["uwso_temperature"]
         return custom["epoch"] + 1
-
-    def step_scheduler(self, epoch: int) -> None:
-        if epoch >= self.swa_start_epoch:
-            self.swa_model.update_parameters(self.model)
-            self.swa_scheduler.step()
-        else:
-            self.scheduler.step()
-
-    def should_early_stop(self, val_loss: float) -> bool:
-        score = -val_loss
-        if score < self._early_stop_best_score + self.early_stopping_min_delta:
-            self._early_stop_counter += 1
-        else:
-            self._early_stop_best_score = score
-            self._early_stop_counter = 0
-        return self._early_stop_counter >= self.early_stopping_patience
-
-    def train_epoch(
-        self,
-        train_loader: torch.utils.data.DataLoader,
-    ) -> dict[str, Any]:
-        self.model.train()
-
-        if self.distill:
-            return self._train_epoch_distill(train_loader)
-        return self._train_epoch_baseline(train_loader)
 
     def _train_epoch_baseline(
         self,
@@ -192,35 +184,35 @@ class Trainer:
         total_loss = 0.0
         correct = 0
         total = 0
-        batch_count = 0
 
         for batch in train_loader:
-            inputs = batch["pixel_values"].to(self.device, non_blocking=True)
-            targets = batch["label"].to(self.device, non_blocking=True)
+            inputs = batch["pixel_values"].to(self.device)
+            targets = batch["label"].to(self.device)
 
             inputs, mixed_targets = self.mixup_cutmix(inputs, targets)
 
             with self.accelerator.autocast():
-                student_results = self.model(inputs)
-                loss = self.criterion(student_results.output, mixed_targets)
+                logits = self.model(inputs)
+                loss = self.criterion(logits, mixed_targets)
 
             self.accelerator.backward(loss)
 
             self.accelerator.clip_grad_norm_(
                 self.model.parameters(),
-                self._grad_clip_norm,
+                1.0,
             )
             self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            self.ema_model.update_parameters(self.model)
+            self.optimizer.zero_grad()
 
-            total_loss += loss.item()
-            predicted = student_results.output.argmax(1)
+            n = targets.size(0)
+            total_loss += loss.item() * n
+            predicted = logits.argmax(1)
             correct += predicted.eq(targets).sum().item()
-            total += targets.size(0)
-            batch_count += 1
+            total += n
 
         return {
-            "train_total_loss": total_loss / batch_count,
+            "train_total_loss": total_loss / total,
             "train_acc": 100.0 * correct / total,
             "total_samples": total,
         }
@@ -229,86 +221,76 @@ class Trainer:
         self,
         train_loader: torch.utils.data.DataLoader,
     ) -> dict[str, Any]:
-        self._teacher.model.eval()
-
-        _LOSS_KEYS = ("ce_loss", "rsd_loss", "rel_loss", "attn_loss", "spectral_loss")
-        loss_accum: dict[str, float] = defaultdict(float)
+        _LOSS_KEYS = ("ce_loss", "rsd_loss", "dsgt_loss", "attn_loss")
+        loss_accum = defaultdict(float)
         correct = 0
         total = 0
-        batch_count = 0
 
         for batch in train_loader:
-            clean_imgs = batch["clean"].to(self.device, non_blocking=True)
-            student_imgs = batch["augmented"].to(self.device, non_blocking=True)
-            targets = batch["label"].to(self.device, non_blocking=True)
+            clean_imgs = batch["clean"].to(self.device)
+            student_imgs = batch["augmented"].to(self.device)
+            targets = batch["label"].to(self.device)
 
             student_imgs, mixed_targets = self.mixup_cutmix(student_imgs, targets)
 
             with self.accelerator.autocast():
-                student_results = self.model(
-                    student_imgs,
-                    layer_indices=self.token_layers,
+                student_logits, s_tokens, s_attns = _extract_student(
+                    self.model, student_imgs, self.token_layers,
                 )
 
-                teacher_results = extract_intermediates(
-                    self._teacher.model, clean_imgs,
-                    num_layers=self._teacher.num_layers,
-                    loader=self._teacher.loader,
-                    feature_format=self._teacher.feature_format,
-                )
+                teacher_tokens, teacher_attns = extract_intermediates(self._teacher, clean_imgs)
 
                 loss, loss_dict = self.basd_loss(
-                    student_results.output,
+                    student_logits,
                     mixed_targets,
-                    student_results.intermediates,
-                    student_results.attention_weights,
-                    teacher_results.all_tokens,
-                    teacher_results.all_attentions,
+                    s_tokens,
+                    s_attns,
+                    teacher_tokens,
+                    teacher_attns,
                 )
 
             self.accelerator.backward(loss)
-            self.basd_loss.post_step_update(loss_dict)
 
             self.accelerator.clip_grad_norm_(
-                list(self.model.parameters())
-                + list(self.basd_loss.parameters()),
-                self._grad_clip_norm,
+                itertools.chain(self.model.parameters(), self.basd_loss.parameters()),
+                1.0,
             )
             self.optimizer.step()
             self.basd_loss.project_to_stiefel()
-            self.optimizer.zero_grad(set_to_none=True)
+            self.ema_model.update_parameters(self.model)
+            self.optimizer.zero_grad()
 
-            loss_accum["total_loss"] += loss.item()
+            n = targets.size(0)
+            loss_accum["total_loss"] += loss.item() * n
             for key in _LOSS_KEYS:
-                loss_accum[key] += loss_dict[key]
+                loss_accum[key] += loss_dict[key] * n
 
-            predicted = student_results.output.argmax(1)
+            predicted = student_logits.argmax(1)
             correct += predicted.eq(targets).sum().item()
-            total += targets.size(0)
-            batch_count += 1
+            total += n
 
-        result = {f"train_{k}": v / batch_count for k, v in loss_accum.items()}
+        result = {f"train_{k}": v / total for k, v in loss_accum.items()}
         result["train_acc"] = 100.0 * correct / total
         result["total_samples"] = total
-        for key in loss_dict:
-            if key.startswith("weight_"):
-                result[key] = loss_dict[key]
         return result
 
     def train(
         self,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
-        start_epoch: int = 0,
+        start_epoch: int,
     ) -> dict[str, list[Any]]:
         num_epochs = self.config.training.num_epochs
-        epoch = start_epoch
 
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
             epoch_start_time = time.time()
 
-            train_metrics = self.train_epoch(train_loader)
+            self.model.train()
+            if self.distill:
+                train_metrics = self._train_epoch_distill(train_loader)
+            else:
+                train_metrics = self._train_epoch_baseline(train_loader)
 
             val_metrics = evaluate_model(
                 self.model, val_loader, self.device,
@@ -316,7 +298,7 @@ class Trainer:
                 num_classes=self.config.model.num_classes,
             )
 
-            self.step_scheduler(epoch)
+            self.scheduler.step()
 
             epoch_time = time.time() - epoch_start_time
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -328,9 +310,8 @@ class Trainer:
                     f"train_loss={train_metrics['train_total_loss']:.6f} "
                     f"ce={train_metrics['train_ce_loss']:.6f} "
                     f"rsd={train_metrics['train_rsd_loss']:.6f} "
-                    f"rel={train_metrics['train_rel_loss']:.6f} "
+                    f"dsgt={train_metrics['train_dsgt_loss']:.6f} "
                     f"attn={train_metrics['train_attn_loss']:.6f} "
-                    f"spectral={train_metrics['train_spectral_loss']:.6f} "
                     f"train_acc={train_metrics['train_acc']:.4f} "
                     f"val_acc={val_metrics['val_acc']:.4f} "
                     f"lr={current_lr:.8f} "
@@ -355,27 +336,13 @@ class Trainer:
 
             if val_metrics["val_acc"] > self.best_val_acc:
                 self.best_val_acc = val_metrics["val_acc"]
-                self.save_checkpoint("best_model", epoch, val_metrics)
-                self.save_model_for_eval("best_model.pth", epoch)
+                self.save_checkpoint("best_model", epoch)
+                self.save_weights("best_model.pth", epoch)
 
             if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}", epoch, val_metrics)
+                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}", epoch)
 
-            if self.should_early_stop(val_metrics["loss"]):
-                print(f"event=early_stop epoch={epoch + 1} val_loss={val_metrics['loss']:.6f}")
-                break
-
-        if self.distill:
-            def _bn_loader():
-                for batch in train_loader:
-                    yield batch["clean"], batch["label"]
-            torch.optim.swa_utils.update_bn(_bn_loader(), self.swa_model, self.device)
-        else:
-            def _bn_loader():
-                for batch in train_loader:
-                    yield batch["pixel_values"], batch["label"]
-            torch.optim.swa_utils.update_bn(_bn_loader(), self.swa_model, self.device)
-        self.save_swa_for_eval("swa_model.pth", epoch)
+        self.save_weights("ema_model.pth", epoch, ema=True)
         print(f"event=train_complete best_val_acc={self.best_val_acc:.4f}")
 
-        return dict(self.metrics_history)
+        return self.metrics_history

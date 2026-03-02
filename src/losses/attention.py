@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 
 import torch
@@ -47,7 +45,7 @@ class AttentionDistillationLoss(nn.Module):
             mode="bilinear", align_corners=False,
         )
         attn_resized = attn_resized.reshape(B, H, target_size, target_size)
-        return attn_resized / (attn_resized.sum(dim=-1, keepdim=True) + 1e-8)
+        return attn_resized / attn_resized.sum(dim=-1, keepdim=True)
 
     def forward(
         self,
@@ -64,17 +62,10 @@ class AttentionDistillationLoss(nn.Module):
 
         aligned_per_layer = aligned_logits.split(self.teacher_heads_per_layer, dim=1)
 
-        T = self.temperature
-        device = s_stacked.device
-        total_loss = torch.tensor(0.0, device=device)
-
+        losses = []
         for i, layer in enumerate(layer_indices):
-            t_attn = teacher_attns[layer]
-            t_attn = self._align_resolution(t_attn, N_s)
-            s_log_prob = F.log_softmax(aligned_per_layer[i] / T, dim=-1)
-            t_prob = t_attn
+            t_attn = self._align_resolution(teacher_attns[layer], N_s)
+            s_log_prob = F.log_softmax(aligned_per_layer[i] / self.temperature, dim=-1)
+            losses.append(F.kl_div(s_log_prob, t_attn, reduction="batchmean"))
 
-            kl = F.kl_div(s_log_prob, t_prob, reduction="batchmean")
-            total_loss = total_loss + kl
-
-        return total_loss / len(layer_indices)
+        return torch.stack(losses).mean()

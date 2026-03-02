@@ -12,14 +12,14 @@ dependencies = [
     "torchmetrics==1.8.2",
     "numpy==2.4.2",
     "PyYAML==6.0.1",
-    "datasets==4.5.0",
-    "timm==1.0.25",
+    "datasets==4.6.1",
+    "timm==1.0.24",
     "accelerate==1.12.0",
 ]
 
 [project.scripts]
-basd-train = "vit_inductive_bias_distillation.train:main"
-basd-eval = "vit_inductive_bias_distillation.eval:main"
+basd-train = "src.train:main"
+basd-eval = "src.eval:main"
 
 [tool.setuptools.packages.find]
-include = ["vit_inductive_bias_distillation*"]
+include = ["src*"]

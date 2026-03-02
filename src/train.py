@@ -1,17 +1,15 @@
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator
 
-from vit_inductive_bias_distillation.config import load_config, setup_torch_backends
-from vit_inductive_bias_distillation.data.datasets import create_dataloaders
-from vit_inductive_bias_distillation.evaluation.metrics import run_eval_suite, save_metrics
-from vit_inductive_bias_distillation.models.deit import DeiT
-from vit_inductive_bias_distillation.models.teacher import load_teacher
-from vit_inductive_bias_distillation.training.trainer import Trainer
+from src.config import load_config
+from src.data.datasets import create_dataloaders
+from src.evaluation.metrics import run_eval_suite, save_metrics
+from src.models.deit import DeiT
+from src.models.teacher import load_teacher
+from src.training.trainer import Trainer
 
 
 def main() -> None:
@@ -19,11 +17,14 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True, help="Path to experiment config YAML")
     args = parser.parse_args()
 
-    setup_torch_backends()
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     config = load_config(args.config)
     torch.manual_seed(config.run.seed)
 
-    accelerator = Accelerator(mixed_precision={"bfloat16": "bf16", "float16": "fp16"}[config.training.autocast_dtype])
+    accelerator = Accelerator(mixed_precision="bf16")
 
     output_dir = Path(config.run.output_dir) / config.run.name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -37,7 +38,10 @@ def main() -> None:
         train_loader, val_loader = create_dataloaders(config, view_mode="single")
         trainer = Trainer(student, config, accelerator=accelerator)
     else:
-        teacher = load_teacher(config.basd.teacher_model_name, accelerator.device, config.basd.teacher_loader)
+        teacher = load_teacher(
+            config.basd.teacher_model_name, accelerator.device,
+            config.basd.teacher_loader, img_size=config.model.vit.img_size,
+        )
         train_loader, val_loader = create_dataloaders(config, view_mode="dual")
         trainer = Trainer(student, config, accelerator=accelerator, teacher=teacher)
 
@@ -48,9 +52,9 @@ def main() -> None:
 
     trainer.train(train_loader, val_loader, start_epoch=start_epoch)
 
-    swa_model = accelerator.unwrap_model(trainer.swa_model.module)
+    ema_model = accelerator.unwrap_model(trainer.ema_model.module)
     results = run_eval_suite(
-        swa_model, config, accelerator.device,
+        ema_model, config, accelerator.device,
         config_path=args.config,
     )
 

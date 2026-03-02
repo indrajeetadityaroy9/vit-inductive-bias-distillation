@@ -1,6 +1,6 @@
-# Table 3: BASD DeiT-Tiny on CIFAR-100
+# Table 3: DeiT-Tiny baseline on CIFAR-100 (no distillation)
 run:
-  name: basd_cifar100
+  name: baseline_cifar100
 data:
   dataset: uoft-cs/cifar100
   eval_datasets: []
@@ -10,5 +10,6 @@ model:
     img_size: 32
     patch_size: 4
 training:
+  mode: baseline
   num_epochs: 200
   learning_rate: 5e-4

@@ -1,16 +1,6 @@
+# Table 2: Cross-architecture distillation (ConvNeXt-Tiny teacher)
 run:
   name: basd_imagenet_cross_arch
-
-data:
-  dataset: ILSVRC/imagenet-1k
-  eval_datasets:
-    - barkermrl/imagenet-a
-    - axiong/imagenet-r
-    - songweig/imagenet_sketch
-
-model:
-  student_preset: deit_tiny
-
 basd:
   teacher_model_name: convnextv2_tiny
   teacher_loader: timm

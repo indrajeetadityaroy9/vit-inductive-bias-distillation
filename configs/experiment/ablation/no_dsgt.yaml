@@ -1,0 +1,5 @@
+# Table 4: Ablation — disable DSGT component
+run:
+  name: ablation_no_dsgt
+basd:
+  disabled_components: [dsgt]
