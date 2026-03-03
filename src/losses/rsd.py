@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 
-_VARIANCE_FLOOR = 1e-5
-
 
 class RedundancySuppressionLoss(nn.Module):
     def __init__(
@@ -17,7 +15,7 @@ class RedundancySuppressionLoss(nn.Module):
         self.kappa = kappa
         self.teacher_dim = teacher_dim
 
-        hidden_dim = max(student_dim, teacher_dim) * 2
+        hidden_dim = max(student_dim, teacher_dim)
         self.aad_projectors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(student_dim, hidden_dim),
@@ -25,6 +23,15 @@ class RedundancySuppressionLoss(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, teacher_dim),
             )
+            for _ in range(num_layers)
+        ])
+
+        self.student_bn = nn.ModuleList([
+            nn.BatchNorm1d(teacher_dim, affine=False)
+            for _ in range(num_layers)
+        ])
+        self.teacher_bn = nn.ModuleList([
+            nn.BatchNorm1d(teacher_dim, affine=False)
             for _ in range(num_layers)
         ])
 
@@ -48,12 +55,8 @@ class RedundancySuppressionLoss(nn.Module):
             ).float()
             t_2d = teacher_tokens.reshape(M, D_t).float()
 
-            s_mean, t_mean = s_2d.mean(0), t_2d.mean(0)
-            s_std = (s_2d - s_mean).pow(2).mean(0).sqrt().clamp(min=_VARIANCE_FLOOR)
-            t_std = (t_2d - t_mean).pow(2).mean(0).sqrt().clamp(min=_VARIANCE_FLOOR)
-
-            s_norm = (s_2d - s_mean) / s_std
-            t_norm = (t_2d - t_mean) / t_std
+            s_norm = self.student_bn[i](s_2d)
+            t_norm = self.teacher_bn[i](t_2d)
 
             cc = s_norm.T @ t_norm / M
             target = torch.eye(D_t, device=cc.device, dtype=cc.dtype)

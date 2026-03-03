@@ -11,7 +11,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from src.data.datasets import dataset_info, create_dataloaders, build_eval_transform
 from src.evaluation.metrics import run_eval_suite, save_metrics
-from src.models.teacher import load_teacher, estimate_intrinsic_dim, probe_model
+from src.models.teacher import TeacherModel, load_teacher, estimate_intrinsic_dim, probe_model
 from src.resolvers import register_resolvers
 from src.training.trainer import Trainer
 
@@ -55,10 +55,10 @@ def _create_student(
     return model.to(device)
 
 
-def _derive_from_teacher(teacher, intrinsic_dim: int) -> dict:
+def _derive_from_teacher(teacher: TeacherModel, intrinsic_dim: int) -> dict:
     head_dim = teacher.embed_dim // teacher.heads_per_layer[0]
     D_s = math.ceil(intrinsic_dim / head_dim) * head_dim
-    D_s = max(head_dim, min(D_s, teacher.embed_dim))
+    D_s = min(D_s, teacher.embed_dim)
     return {
         "embed_dim": D_s,
         "depth": teacher.depth,
@@ -75,6 +75,7 @@ def main(config: DictConfig) -> None:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     torch.manual_seed(config.run.seed)
 
@@ -107,9 +108,12 @@ def main(config: DictConfig) -> None:
                 img_size, mean=teacher.mean, std=teacher.std,
                 crop_ratio=config.data.eval_crop_ratio,
             )
+            tokens_per_image = (img_size // config.model.vit.patch_size) ** 2
+            num_calib = math.ceil(10 * teacher.embed_dim / tokens_per_image)
+
             calib_ds = hf_load_dataset(
                 config.data.dataset, split=ds_info["train_split"], streaming=True,
-            ).take(32)
+            ).take(num_calib)
             calib_images = torch.stack([
                 calib_tf(ex[ds_info["image_key"]].convert("RGB")) for ex in calib_ds
             ]).to(accelerator.device)
@@ -117,7 +121,7 @@ def main(config: DictConfig) -> None:
             intrinsic_dim = estimate_intrinsic_dim(teacher, calib_images)
             arch_overrides = _derive_from_teacher(teacher, intrinsic_dim)
             print(
-                f"event=student_arch_derived intrinsic_dim={intrinsic_dim} "
+                f"student_arch_derived intrinsic_dim={intrinsic_dim} "
                 f"embed_dim={arch_overrides['embed_dim']} "
                 f"depth={arch_overrides['depth']} num_heads={arch_overrides['num_heads']} "
                 f"mlp_ratio={arch_overrides['mlp_ratio']:.1f}"
@@ -140,7 +144,7 @@ def main(config: DictConfig) -> None:
 
         student_info = probe_model(student, accelerator.device, img_size)
         print(
-            f"event=student_probed embed_dim={student_info['embed_dim']} "
+            f"student_probed embed_dim={student_info['embed_dim']} "
             f"depth={student_info['depth']} num_tokens={student_info['num_tokens']} "
             f"heads_per_layer={student_info['heads_per_layer']} "
             f"has_cls={student_info['has_cls_token']} "
@@ -171,7 +175,7 @@ def main(config: DictConfig) -> None:
         config_path=str(output_dir / "config.yaml"),
     )
 
-    save_metrics(results, output_dir, config)
+    save_metrics(results, output_dir)
 
 
 if __name__ == "__main__":

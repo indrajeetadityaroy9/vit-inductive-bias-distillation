@@ -1,4 +1,3 @@
-from functools import lru_cache
 from typing import Literal
 
 import numpy as np
@@ -20,7 +19,7 @@ from torchvision.transforms.v2 import (
 
 _NUM_WORKERS = 8
 
-@lru_cache(maxsize=8)
+
 def dataset_info(dataset_name: str) -> dict:
     builder = load_dataset_builder(dataset_name)
     features = builder.info.features
@@ -47,24 +46,27 @@ def dataset_info(dataset_name: str) -> dict:
     }
 
 
-@lru_cache(maxsize=4)
 def get_channel_stats(dataset_name: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
     info = dataset_info(dataset_name)
     ds = load_dataset(dataset_name, split=info["train_split"], streaming=True).take(5000)
 
-    pixel_sum = np.zeros(3, dtype=np.float64)
-    pixel_sq_sum = np.zeros(3, dtype=np.float64)
-    pixel_count = 0
+    mean = np.zeros(3, dtype=np.float64)
+    m2 = np.zeros(3, dtype=np.float64)
+    count = 0
 
     for example in ds:
         arr = np.asarray(example[info["image_key"]].convert("RGB"), dtype=np.float64) / 255.0
         flat = arr.reshape(-1, 3)
-        pixel_sum += flat.sum(axis=0)
-        pixel_sq_sum += (flat ** 2).sum(axis=0)
-        pixel_count += flat.shape[0]
+        n = flat.shape[0]
+        batch_mean = flat.mean(axis=0)
+        batch_var = flat.var(axis=0)
+        delta = batch_mean - mean
+        new_count = count + n
+        mean += delta * n / new_count
+        m2 += batch_var * n + delta ** 2 * count * n / new_count
+        count = new_count
 
-    mean = pixel_sum / pixel_count
-    std = np.sqrt(pixel_sq_sum / pixel_count - mean ** 2)
+    std = np.sqrt(m2 / count)
     return tuple(mean.tolist()), tuple(std.tolist())
 
 
@@ -94,49 +96,6 @@ def build_eval_transform(
     ])
 
 
-def _build_augmented_transform(
-    image_size: int,
-    *,
-    mean: tuple[float, ...],
-    std: tuple[float, ...],
-) -> Compose:
-    return Compose([
-        RandomResizedCrop(image_size),
-        RandomHorizontalFlip(),
-        TrivialAugmentWide(),
-        ToImage(),
-        ToDtype(torch.float32, scale=True),
-        Normalize(mean, std),
-    ])
-
-
-def _apply_transform(
-    examples: dict,
-    transform: Compose,
-    image_key: str,
-    label_key: str,
-) -> dict:
-    return {
-        "pixel_values": [transform(img.convert("RGB")) for img in examples[image_key]],
-        "label": examples[label_key],
-    }
-
-
-def _apply_dual_transform(
-    examples: dict,
-    clean_tf: Compose,
-    aug_tf: Compose,
-    image_key: str,
-    label_key: str,
-) -> dict:
-    images = [img.convert("RGB") for img in examples[image_key]]
-    return {
-        "clean": [clean_tf(img) for img in images],
-        "augmented": [aug_tf(img) for img in images],
-        "label": examples[label_key],
-    }
-
-
 def create_eval_loader(
     dataset_name: str,
     *,
@@ -151,9 +110,10 @@ def create_eval_loader(
     image_key, label_key = info["image_key"], info["label_key"]
 
     ds = load_dataset(dataset_name, split=info["eval_split"])
-    ds.set_transform(
-        lambda ex: _apply_transform(ex, transform, image_key, label_key)
-    )
+    ds.set_transform(lambda ex: {
+        "pixel_values": [transform(img.convert("RGB")) for img in ex[image_key]],
+        "label": ex[label_key],
+    })
 
     return DataLoader(
         ds,
@@ -177,7 +137,14 @@ def create_dataloaders(
     image_key, label_key = info["image_key"], info["label_key"]
     crop_ratio = config.data.eval_crop_ratio
 
-    aug_tf = _build_augmented_transform(image_size, mean=mean, std=std)
+    aug_tf = Compose([
+        RandomResizedCrop(image_size),
+        RandomHorizontalFlip(),
+        TrivialAugmentWide(),
+        ToImage(),
+        ToDtype(torch.float32, scale=True),
+        Normalize(mean, std),
+    ])
 
     train_ds = load_dataset(config.data.dataset, split=info["train_split"])
 
@@ -186,13 +153,16 @@ def create_dataloaders(
         clean_tf = build_eval_transform(
             image_size, mean=teacher_mean, std=teacher_std, crop_ratio=crop_ratio,
         )
-        train_ds.set_transform(
-            lambda ex: _apply_dual_transform(ex, clean_tf, aug_tf, image_key, label_key)
-        )
+        train_ds.set_transform(lambda ex: {
+            "clean": [clean_tf(img.convert("RGB")) for img in ex[image_key]],
+            "augmented": [aug_tf(img.convert("RGB")) for img in ex[image_key]],
+            "label": ex[label_key],
+        })
     else:
-        train_ds.set_transform(
-            lambda ex: _apply_transform(ex, aug_tf, image_key, label_key)
-        )
+        train_ds.set_transform(lambda ex: {
+            "pixel_values": [aug_tf(img.convert("RGB")) for img in ex[image_key]],
+            "label": ex[label_key],
+        })
 
     train_loader = DataLoader(
         train_ds,

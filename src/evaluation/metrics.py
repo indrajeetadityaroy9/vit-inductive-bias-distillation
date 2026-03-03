@@ -6,12 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from torch.utils.flop_counter import FlopCounterMode
-from torchmetrics.classification import (
-    MulticlassAccuracy,
-    MulticlassCalibrationError,
-)
-
-from omegaconf import OmegaConf
+from torchmetrics.classification import MulticlassAccuracy
 
 from src.data.datasets import (
     create_eval_loader,
@@ -35,7 +30,6 @@ def evaluate_model(
 
     acc_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1, average="micro").to(device)
     acc_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5, average="micro").to(device)
-    ece = MulticlassCalibrationError(num_classes=num_classes, n_bins=15, norm="l1").to(device)
 
     total_loss = 0.0
     total = 0
@@ -54,13 +48,11 @@ def evaluate_model(
 
         acc_top1.update(outputs, targets)
         acc_top5.update(outputs, targets)
-        ece.update(outputs, targets)
 
     return {
         "val_acc": 100.0 * acc_top1.compute().item(),
         "val_acc_top5": 100.0 * acc_top5.compute().item(),
         "loss": total_loss / total,
-        "ece": ece.compute().item(),
     }
 
 
@@ -107,56 +99,6 @@ def measure_efficiency(
     }
 
 
-def evaluate_on_datasets(
-    model: nn.Module,
-    config,
-    device: torch.device,
-    criterion: nn.Module,
-    *,
-    dataset_names: list[str],
-    primary_dataset: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    primary_results = {}
-    robustness_results = {}
-
-    mean, std = get_channel_stats(primary_dataset)
-
-    crop_ratio = config.data.eval_crop_ratio
-
-    primary_num_classes = dataset_info(primary_dataset)["num_classes"]
-
-    for ds_name in dataset_names:
-        loader = create_eval_loader(
-            ds_name,
-            image_size=config.model.vit.img_size,
-            batch_size=config.data.batch_size,
-            mean=mean,
-            std=std,
-            crop_ratio=crop_ratio,
-        )
-
-        valid_indices = get_subset_indices(ds_name, primary_dataset)
-        num_classes = len(valid_indices) if valid_indices is not None else primary_num_classes
-
-        metrics = evaluate_model(
-            model, loader, device, criterion,
-            num_classes=num_classes, valid_indices=valid_indices,
-        )
-
-        if ds_name == primary_dataset:
-            primary_results = metrics
-        else:
-            robustness_results[ds_name] = metrics
-
-        print(
-            f"event=eval_dataset dataset={ds_name} "
-            f"top1={metrics['val_acc']:.4f} top5={metrics['val_acc_top5']:.4f} "
-            f"loss={metrics['loss']:.6f} ece={metrics['ece']:.6f}"
-        )
-
-    return primary_results, robustness_results
-
-
 def run_eval_suite(
     model: nn.Module,
     config,
@@ -167,11 +109,41 @@ def run_eval_suite(
     criterion = nn.CrossEntropyLoss()
     datasets_to_eval = [config.data.dataset] + list(config.data.eval_datasets)
 
-    primary_results, robustness_results = evaluate_on_datasets(
-        model, config, device, criterion,
-        dataset_names=datasets_to_eval,
-        primary_dataset=config.data.dataset,
-    )
+    primary_results = {}
+    robustness_results = {}
+
+    mean, std = get_channel_stats(config.data.dataset)
+    crop_ratio = config.data.eval_crop_ratio
+    primary_num_classes = dataset_info(config.data.dataset)["num_classes"]
+
+    for ds_name in datasets_to_eval:
+        loader = create_eval_loader(
+            ds_name,
+            image_size=config.model.vit.img_size,
+            batch_size=config.data.batch_size,
+            mean=mean,
+            std=std,
+            crop_ratio=crop_ratio,
+        )
+
+        valid_indices = get_subset_indices(ds_name, config.data.dataset)
+        num_classes = len(valid_indices) if valid_indices is not None else primary_num_classes
+
+        metrics = evaluate_model(
+            model, loader, device, criterion,
+            num_classes=num_classes, valid_indices=valid_indices,
+        )
+
+        if ds_name == config.data.dataset:
+            primary_results = metrics
+        else:
+            robustness_results[ds_name] = metrics
+
+        print(
+            f"eval {ds_name} "
+            f"top1={metrics['val_acc']:.4f} top5={metrics['val_acc_top5']:.4f} "
+            f"loss={metrics['loss']:.6f}"
+        )
 
     efficiency = measure_efficiency(
         model, device,
@@ -179,9 +151,9 @@ def run_eval_suite(
     )
 
     print(
-        f"event=eval_efficiency dataset={config.data.dataset} "
-        f"params_m={efficiency['param_count_m']:.4f} gflops={efficiency['gflops']:.4f} "
-        f"throughput_img_per_sec={efficiency['throughput_img_per_sec']:.2f}"
+        f"efficiency params_m={efficiency['param_count_m']:.4f} "
+        f"gflops={efficiency['gflops']:.4f} "
+        f"throughput={efficiency['throughput_img_per_sec']:.2f} img/s"
     )
 
     return {
@@ -195,13 +167,7 @@ def run_eval_suite(
     }
 
 
-def save_metrics(
-    results: dict[str, Any],
-    output_dir: Path,
-    config,
-) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(config, output_dir / "config.yaml")
+def save_metrics(results: dict[str, Any], output_dir: Path) -> Path:
     metrics_path = output_dir / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(results, f, indent=2)

@@ -12,9 +12,8 @@ def geometric_relational_loss(
     """Attention-weighted Procrustes loss.
 
     When has_cls_token=True, CLS-token attention weights encode token
-    importance (arXiv 2509.25253, Theorem 3). When False, mean attention
-    across query dimension serves as importance proxy.
-    Teacher tokens remain attached to preserve projector gradients.
+    importance. When False, mean attention across query dimension serves
+    as importance proxy.
     """
     s = student_tokens.float()
     t = teacher_tokens.float()

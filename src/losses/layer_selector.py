@@ -33,9 +33,8 @@ def _grassmann_subspace(
 ) -> torch.Tensor:
     z = z_flat.float()
     z = z - z.mean(dim=0, keepdim=True)
-    M, d = z.shape
+    M = z.shape[0]
     cov = z.T @ z / M
-    cov = cov + 1e-4 * torch.eye(d, device=cov.device, dtype=cov.dtype)
     _, eigvecs = torch.linalg.eigh(cov)
     return eigvecs[:, -k:]
 
@@ -49,7 +48,7 @@ class GrassmannianLayerSelector(nn.Module):
     ):
         super().__init__()
         self.student_dim = student_dim
-        self.subspace_rank = student_dim // 4
+        self.subspace_ranks: dict[int, int] = {}
         self._rank_calibrated = False
 
         proj_s = torch.empty(student_dim, student_dim)
@@ -70,33 +69,15 @@ class GrassmannianLayerSelector(nn.Module):
     def temperatures(self) -> torch.Tensor:
         return F.softplus(self.log_temperatures)
 
-    def _calibrate_rank(self, sample_tokens: torch.Tensor) -> None:
+    def _calibrate_rank(self, all_teacher_tokens: dict[int, torch.Tensor]) -> None:
         if self._rank_calibrated:
             return
         with torch.no_grad():
-            sample_z = sample_tokens.reshape(-1, sample_tokens.shape[2]) @ self.proj_t.T
-            auto_rank = marchenko_pastur_rank(sample_z)
-            self.subspace_rank = min(auto_rank, self.student_dim - 1)
+            for idx, tokens in all_teacher_tokens.items():
+                sample_z = tokens.reshape(-1, tokens.shape[2]) @ self.proj_t.T
+                auto_rank = marchenko_pastur_rank(sample_z)
+                self.subspace_ranks[idx] = min(auto_rank, self.student_dim - 1)
         self._rank_calibrated = True
-
-    def _compute_teacher_state(
-        self,
-        all_teacher_tokens: dict[int, torch.Tensor],
-        all_teacher_attns: dict[int, torch.Tensor],
-        teacher_indices: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
-        D_t = all_teacher_tokens[teacher_indices[0]].shape[2]
-
-        stacked_tokens = torch.stack([all_teacher_tokens[idx] for idx in teacher_indices])
-        stacked_attns = torch.stack([all_teacher_attns[idx] for idx in teacher_indices])
-
-        subspaces = {}
-        with torch.no_grad():
-            for idx in teacher_indices:
-                z_t = all_teacher_tokens[idx].reshape(-1, D_t) @ self.proj_t.T
-                subspaces[idx] = _grassmann_subspace(z_t, k=self.subspace_rank)
-
-        return stacked_tokens, stacked_attns, subspaces
 
     def _mix_for_student_layer(
         self,
@@ -107,26 +88,31 @@ class GrassmannianLayerSelector(nn.Module):
         stacked_attns: torch.Tensor,
         subspaces: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        k = self.subspace_rank
-
         D_s = s_tokens.shape[2]
         s_flat = s_tokens.reshape(-1, D_s)
         z_s = s_flat @ self.proj_s.T
-        U_s = _grassmann_subspace(z_s, k=k)
+
+        z_s_c = z_s.float()
+        z_s_c = z_s_c - z_s_c.mean(dim=0, keepdim=True)
+        M_s = z_s_c.shape[0]
+        cov_s = z_s_c.T @ z_s_c / M_s
+        _, all_student_eigvecs = torch.linalg.eigh(cov_s)
 
         d_grass_sq = torch.zeros(len(teacher_indices), device=stacked_tokens.device)
         for j, t_idx in enumerate(teacher_indices):
+            k = self.subspace_ranks[t_idx]
+            U_s = all_student_eigvecs[:, -k:]
             U_t = subspaces[t_idx]
             sigma = torch.linalg.svdvals(U_s.T @ U_t)
-            theta = torch.acos(sigma.clamp(max=1.0 - 1e-7))
-            d_grass_sq[j] = theta.pow(2).sum()
+            theta = torch.acos(sigma.clamp(max=1.0 - torch.finfo(sigma.dtype).eps))
+            d_grass_sq[j] = theta.pow(2).sum() / k
 
         tau = self.temperatures[i]
-        weights = F.softmax(-d_grass_sq / (k * tau), dim=0)
+        weights = F.softmax(-d_grass_sq / tau, dim=0)
 
-        weights_mix = weights.to(stacked_tokens.dtype)
-        mixed = (weights_mix.view(-1, 1, 1, 1) * stacked_tokens).sum(dim=0)
-        mixed_attn = (weights_mix.view(-1, 1, 1, 1, 1) * stacked_attns).sum(dim=0)
+        weights = weights.to(stacked_tokens.dtype)
+        mixed = (weights.view(-1, 1, 1, 1) * stacked_tokens).sum(dim=0)
+        mixed_attn = (weights.view(-1, 1, 1, 1, 1) * stacked_attns).sum(dim=0)
 
         return mixed, mixed_attn
 
@@ -139,10 +125,17 @@ class GrassmannianLayerSelector(nn.Module):
     ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
         teacher_indices = sorted(all_teacher_tokens.keys())
 
-        self._calibrate_rank(all_teacher_tokens[teacher_indices[0]])
-        stacked_tokens, stacked_attns, subspaces = self._compute_teacher_state(
-            all_teacher_tokens, all_teacher_attns, teacher_indices,
-        )
+        self._calibrate_rank(all_teacher_tokens)
+
+        D_t = all_teacher_tokens[teacher_indices[0]].shape[2]
+        stacked_tokens = torch.stack([all_teacher_tokens[idx] for idx in teacher_indices])
+        stacked_attns = torch.stack([all_teacher_attns[idx] for idx in teacher_indices])
+
+        subspaces = {}
+        with torch.no_grad():
+            for idx in teacher_indices:
+                z_t = all_teacher_tokens[idx].reshape(-1, D_t) @ self.proj_t.T
+                subspaces[idx] = _grassmann_subspace(z_t, k=self.subspace_ranks[idx])
 
         mixed_teachers = {}
         mixed_attentions = {}

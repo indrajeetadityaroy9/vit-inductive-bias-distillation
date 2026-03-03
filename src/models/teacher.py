@@ -24,30 +24,16 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def _extract_qk(
-    mod: nn.Module, x_in: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    B, N, C = x_in.shape
-    nh = mod.num_heads
-    hd = C // nh
-
-    qkv = mod.qkv(x_in).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
-    return qkv[0], qkv[1]
-
-
-def _make_attn_capture_hook(
+def make_attn_capture_hook(
     capture_dict: dict, layer_idx: int, *, apply_softmax: bool = True,
 ):
-    """Unified attention capture hook for any attention module.
-
-    Teacher uses apply_softmax=True (probability targets).
-    Student uses apply_softmax=False (logits for KL divergence).
-    """
     def hook(mod, inp, out):
         x_in = inp[0]
-        q, k = _extract_qk(mod, x_in)
-        hd = q.shape[-1]
-        attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+        B, N, C = x_in.shape
+        nh = mod.num_heads
+        hd = C // nh
+        qkv = mod.qkv(x_in).reshape(B, N, 3, nh, hd).permute(2, 0, 3, 1, 4)
+        attn = (qkv[0] @ qkv[1].transpose(-2, -1)) * (hd ** -0.5)
         capture_dict[layer_idx] = attn.softmax(dim=-1) if apply_softmax else attn
 
     return hook
@@ -94,15 +80,12 @@ def probe_model(model: nn.Module, device: torch.device, img_size: int) -> dict:
     probe = torch.zeros(1, 3, img_size, img_size, device=device)
     num_tokens = 0
     with torch.no_grad():
-        if layer_paths:
-            captured = {}
-            mod = model.get_submodule(layer_paths[-1])
-            h = mod.register_forward_hook(lambda m, i, o: captured.update(out=o))
-            model(probe)
-            h.remove()
-            out = captured['out']
-        else:
-            out = model.forward_features(probe)
+        captured = {}
+        mod = model.get_submodule(layer_paths[-1])
+        h = mod.register_forward_hook(lambda m, i, o: captured.update(out=o))
+        model(probe)
+        h.remove()
+        out = captured['out']
 
         if out.dim() == 4:
             feature_format = "nchw" if out.shape[1] > out.shape[3] else "nhwc"
@@ -144,11 +127,10 @@ def load_teacher(model_name: str, device: torch.device,
     info = probe_model(model, device, img_size)
 
     print(
-        f"event=teacher_loaded model={model_name} embed_dim={info['embed_dim']} "
+        f"teacher_loaded model={model_name} embed_dim={info['embed_dim']} "
         f"depth={info['depth']} heads_per_layer={info['heads_per_layer']} "
-        f"mlp_ratio={info['mlp_ratio']:.1f} "
-        f"feature_format={info['feature_format']} has_cls={info['has_cls_token']} "
-        f"attn_subpath={info['attn_subpath']} "
+        f"mlp_ratio={info['mlp_ratio']:.1f} feature_format={info['feature_format']} "
+        f"has_cls={info['has_cls_token']} attn_subpath={info['attn_subpath']} "
         f"mean={mean} std={std}"
     )
 
@@ -205,8 +187,8 @@ def extract_intermediates(
         features = _to_token_format(features, teacher.feature_format, teacher.has_cls_token)
         B, N, _ = features.shape
         uniform_attn = torch.ones(
-            B, 1, N + 1, N + 1, device=features.device, dtype=features.dtype,
-        ) / (N + 1)
+            B, 1, N, N, device=features.device, dtype=features.dtype,
+        ) / N
         return {0: features}, {0: uniform_attn}
 
     hooks = []
@@ -225,7 +207,7 @@ def extract_intermediates(
         if teacher.attn_subpath is not None:
             attn_mod = teacher.model.get_submodule(f"{path}.{teacher.attn_subpath}")
             hooks.append(attn_mod.register_forward_hook(
-                _make_attn_capture_hook(captured_attns, idx, apply_softmax=True)
+                make_attn_capture_hook(captured_attns, idx, apply_softmax=True)
             ))
 
     teacher.model(x)

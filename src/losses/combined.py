@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.losses.attention import AttentionDistillationLoss
 from src.losses.layer_selector import (
@@ -9,7 +8,6 @@ from src.losses.layer_selector import (
 )
 from src.losses.relational import geometric_relational_loss
 from src.losses.rsd import RedundancySuppressionLoss
-from src.losses.spectral import bures_wasserstein_loss
 
 
 class CrossAttentionProjector(nn.Module):
@@ -86,13 +84,14 @@ class BASDLoss(nn.Module):
 
         if self.use_attn:
             self.attn_loss = AttentionDistillationLoss(
-                student_heads_per_layer=student_heads_per_layer,
-                teacher_heads_per_layer=teacher_heads_per_layer,
+                student_heads_per_layer=[
+                    student_heads_per_layer[l] for l in self.token_layers
+                ],
+                teacher_heads_per_layer=[
+                    teacher_heads_per_layer[l] for l in self.token_layers
+                ],
                 num_layers=len(self.token_layers),
             )
-
-        self.bw_student_proj = nn.Linear(student_dim, teacher_dim, bias=False)
-        nn.init.orthogonal_(self.bw_student_proj.weight)
 
         self.layer_selector = GrassmannianLayerSelector(
             num_extraction_points=len(self.token_layers),
@@ -100,33 +99,10 @@ class BASDLoss(nn.Module):
             teacher_dim=teacher_dim,
         )
 
-        self._raw_uwso_temperature = nn.Parameter(torch.zeros(1))
-
-    @property
-    def uwso_temperature(self) -> torch.Tensor:
-        return F.softplus(self._raw_uwso_temperature)
-
     @torch.no_grad()
     def project_to_stiefel(self) -> None:
         for proj in self.cross_attn_projectors:
             _retract_to_stiefel(proj.output_proj)
-        _retract_to_stiefel(self.bw_student_proj)
-
-    def _dual_space_geometric_loss(
-        self,
-        student_tokens: torch.Tensor,
-        aligned_tokens: torch.Tensor,
-        teacher_attn: torch.Tensor,
-    ) -> torch.Tensor:
-        L_sample = geometric_relational_loss(
-            student_tokens, aligned_tokens, teacher_attn,
-            has_cls_token=self.teacher_has_cls_token,
-        )
-        L_feature = bures_wasserstein_loss(
-            self.bw_student_proj(student_tokens), aligned_tokens,
-        )
-
-        return L_sample + L_feature
 
     def forward(
         self,
@@ -136,7 +112,7 @@ class BASDLoss(nn.Module):
         student_attns: dict[int, torch.Tensor],
         all_teacher_tokens: dict[int, torch.Tensor],
         all_teacher_attns: dict[int, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> torch.Tensor:
         ce_loss = self.base_criterion(student_output, targets)
 
         mixed_tokens, mixed_attns = self.layer_selector(
@@ -150,40 +126,27 @@ class BASDLoss(nn.Module):
                 mixed_tokens[layer_idx]
             )
 
-        loss_info = {"ce_loss": ce_loss.item()}
-
         rsd_loss = self.rsd_loss(
             student_intermediates, aligned_tokens, self.token_layers
         )
-        loss_info["rsd_loss"] = rsd_loss.item()
 
-        dsgt_losses = [
-            self._dual_space_geometric_loss(
+        geo_losses = []
+        for layer_idx in self.token_layers:
+            geo_losses.append(geometric_relational_loss(
                 student_intermediates[layer_idx], aligned_tokens[layer_idx],
                 mixed_attns[layer_idx],
-            )
-            for layer_idx in self.token_layers
-        ]
-        dsgt_loss = torch.stack(dsgt_losses).mean()
-        loss_info["dsgt_loss"] = dsgt_loss.item()
+                has_cls_token=self.teacher_has_cls_token,
+            ))
+        geo_loss = torch.stack(geo_losses).mean()
 
-        vals = [rsd_loss, dsgt_loss]
+        vals = [ce_loss, rsd_loss, geo_loss]
 
         if self.use_attn:
-            attn_loss = self.attn_loss(student_attns, mixed_attns, self.token_layers)
-            loss_info["attn_loss"] = attn_loss.item()
-            vals.append(attn_loss)
-        else:
-            loss_info["attn_loss"] = 0.0
+            vals.append(self.attn_loss(student_attns, mixed_attns, self.token_layers))
 
-        # Inverse-loss softmax weighting (UWSO): w_k = softmax(1/sg[L_k] / T)
-        inv = torch.stack([1.0 / (v.detach() + 1e-8) for v in vals])
-        w = F.softmax(inv / self.uwso_temperature, dim=0)
-        K = len(vals)
-        w = w.clamp(min=1.0 / (2 * K), max=2.0 / K)
-        w = w / w.sum()
-        weighted_sum = sum(w[i] * vals[i] for i in range(len(vals)))
+        # UW-SO weighting (Kirchdorfer et al. 2024): w_i = (1/L_i) / Σ(1/L_j)
+        eps = torch.finfo(vals[0].dtype).eps
+        inv = torch.stack([1.0 / v.detach().clamp(min=eps) for v in vals])
+        w = inv / inv.sum()
 
-        total_loss = ce_loss + weighted_sum
-
-        return total_loss, loss_info
+        return sum(w[i] * vals[i] for i in range(len(vals)))

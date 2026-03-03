@@ -1,7 +1,5 @@
-import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,7 +10,7 @@ from torchvision.transforms.v2 import MixUp, CutMix, RandomChoice
 
 from src.evaluation.metrics import evaluate_model
 from src.losses.combined import BASDLoss
-from src.models.teacher import TeacherModel, extract_intermediates, _make_attn_capture_hook
+from src.models.teacher import TeacherModel, extract_intermediates, make_attn_capture_hook
 
 
 @torch.compiler.disable
@@ -36,7 +34,7 @@ def _extract_student(
         if attn_subpath is not None:
             attn_mod = model.get_submodule(f"{layer_paths[idx]}.{attn_subpath}")
             hooks.append(attn_mod.register_forward_hook(
-                _make_attn_capture_hook(captured_attns, idx, apply_softmax=False)
+                make_attn_capture_hook(captured_attns, idx, apply_softmax=False)
             ))
 
     logits = model(x)
@@ -85,14 +83,8 @@ class Trainer:
                 num_student_tokens=student_info['num_tokens'],
                 cross_attn_num_heads=teacher.heads_per_layer[0],
                 config=config.basd,
-                student_heads_per_layer=[
-                    student_heads[min(i, len(student_heads) - 1)]
-                    for i in range(config.basd.num_extraction_points)
-                ],
-                teacher_heads_per_layer=[
-                    teacher_heads[min(i, len(teacher_heads) - 1)]
-                    for i in range(config.basd.num_extraction_points)
-                ],
+                student_heads_per_layer=student_heads,
+                teacher_heads_per_layer=teacher_heads,
                 teacher_has_cls_token=teacher.has_cls_token,
                 teacher_feature_format=teacher.feature_format,
             ).to(self.device)
@@ -152,7 +144,7 @@ class Trainer:
     def _train_epoch_baseline(
         self,
         train_loader: torch.utils.data.DataLoader,
-    ) -> dict[str, Any]:
+    ) -> dict[str, float]:
         total_loss = 0.0
         correct = 0
         total = 0
@@ -178,17 +170,15 @@ class Trainer:
             total += n
 
         return {
-            "train_total_loss": total_loss / total,
+            "train_loss": total_loss / total,
             "train_acc": 100.0 * correct / total,
-            "total_samples": total,
         }
 
     def _train_epoch_distill(
         self,
         train_loader: torch.utils.data.DataLoader,
-    ) -> dict[str, Any]:
-        _LOSS_KEYS = ("ce_loss", "rsd_loss", "dsgt_loss", "attn_loss")
-        loss_accum = defaultdict(float)
+    ) -> dict[str, float]:
+        total_loss = 0.0
         correct = 0
         total = 0
 
@@ -209,7 +199,7 @@ class Trainer:
 
                 teacher_tokens, teacher_attns = extract_intermediates(self._teacher, clean_imgs)
 
-                loss, loss_dict = self.basd_loss(
+                loss = self.basd_loss(
                     student_logits,
                     mixed_targets,
                     s_tokens,
@@ -224,30 +214,26 @@ class Trainer:
             self.optimizer.zero_grad()
 
             n = targets.size(0)
-            loss_accum["total_loss"] += loss.item() * n
-            for key in _LOSS_KEYS:
-                loss_accum[key] += loss_dict[key] * n
-
+            total_loss += loss.item() * n
             predicted = student_logits.argmax(1)
             correct += predicted.eq(targets).sum().item()
             total += n
 
-        result = {f"train_{k}": v / total for k, v in loss_accum.items()}
-        result["train_acc"] = 100.0 * correct / total
-        result["total_samples"] = total
-        return result
+        return {
+            "train_loss": total_loss / total,
+            "train_acc": 100.0 * correct / total,
+        }
 
     def train(
         self,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         start_epoch: int,
-    ) -> dict[str, list[Any]]:
+    ) -> dict[str, list[float]]:
         num_epochs = self.config.training.num_epochs
+        mode = "distill" if self.distill else "baseline"
 
         for epoch in range(start_epoch, num_epochs):
-            epoch_start_time = time.time()
-
             self.optimizer.train()
             self.model.train()
             if self.distill:
@@ -262,39 +248,15 @@ class Trainer:
                 num_classes=self.config.model.num_classes,
             )
 
-            epoch_time = time.time() - epoch_start_time
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            throughput = train_metrics["total_samples"] / epoch_time
-
-            if self.distill:
-                print(
-                    f"event=epoch_summary mode=distill epoch={epoch + 1} num_epochs={num_epochs} "
-                    f"train_loss={train_metrics['train_total_loss']:.6f} "
-                    f"ce={train_metrics['train_ce_loss']:.6f} "
-                    f"rsd={train_metrics['train_rsd_loss']:.6f} "
-                    f"dsgt={train_metrics['train_dsgt_loss']:.6f} "
-                    f"attn={train_metrics['train_attn_loss']:.6f} "
-                    f"train_acc={train_metrics['train_acc']:.4f} "
-                    f"val_acc={val_metrics['val_acc']:.4f} "
-                    f"lr={current_lr:.8f} "
-                    f"epoch_time_s={epoch_time:.3f} "
-                    f"throughput_img_per_sec={throughput:.2f}"
-                )
-            else:
-                print(
-                    f"event=epoch_summary mode=baseline epoch={epoch + 1} num_epochs={num_epochs} "
-                    f"train_loss={train_metrics['train_total_loss']:.6f} "
-                    f"train_acc={train_metrics['train_acc']:.4f} "
-                    f"val_acc={val_metrics['val_acc']:.4f} "
-                    f"lr={current_lr:.8f} "
-                    f"epoch_time_s={epoch_time:.3f} "
-                    f"throughput_img_per_sec={throughput:.2f}"
-                )
+            print(
+                f"epoch {epoch + 1}/{num_epochs} "
+                f"train_loss={train_metrics['train_loss']:.6f} "
+                f"train_acc={train_metrics['train_acc']:.4f} "
+                f"val_acc={val_metrics['val_acc']:.4f}"
+            )
 
             for key, value in {**train_metrics, **val_metrics}.items():
                 self.metrics_history[key].append(value)
-            self.metrics_history["epoch_time"].append(epoch_time)
-            self.metrics_history["throughput"].append(throughput)
 
             if val_metrics["val_acc"] > self.best_val_acc:
                 self.best_val_acc = val_metrics["val_acc"]
@@ -304,6 +266,6 @@ class Trainer:
             self.save_checkpoint("latest", epoch)
 
         self.save_weights("final_model.pth", num_epochs - 1)
-        print(f"event=train_complete best_val_acc={self.best_val_acc:.4f}")
+        print(f"training complete best_val_acc={self.best_val_acc:.4f}")
 
         return self.metrics_history
